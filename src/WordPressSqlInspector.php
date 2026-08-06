@@ -11,6 +11,7 @@ final class WordPressSqlInspector
 {
     /**
      * @return array{
+     *   table_prefixes:list<array{value:string,tables:int}>,
      *   admin_emails:list<array{value:string,labels:list<string>}>,
      *   image_paths:list<array{value:string,occurrences:int}>,
      *   plugin_groups:list<array{id:string,label:string,original:string,associative:bool,plugins:list<array{path:string,active:bool,value:mixed}>}>
@@ -25,6 +26,7 @@ final class WordPressSqlInspector
 
         $users = [];
         $administratorIds = [];
+        $tablePrefixes = [];
         $emailLabels = [];
         $imagePaths = [];
         $pluginCandidates = [];
@@ -41,6 +43,10 @@ final class WordPressSqlInspector
                     continue;
                 }
                 $type = strtolower($match[1]);
+                $prefix = substr($table, 0, -strlen($match[1]));
+                if ($prefix !== '') {
+                    $tablePrefixes[$prefix][$table] = true;
+                }
                 foreach ($rows as $row) {
                     foreach ($row as $value) {
                         if (is_string($value)) {
@@ -129,6 +135,10 @@ final class WordPressSqlInspector
         ksort($emailLabels, SORT_NATURAL | SORT_FLAG_CASE);
         ksort($imagePaths, SORT_NATURAL | SORT_FLAG_CASE);
         ksort($pluginCandidates, SORT_NATURAL | SORT_FLAG_CASE);
+        uksort($tablePrefixes, static function (string $left, string $right) use ($tablePrefixes): int {
+            $byCount = count($tablePrefixes[$right]) <=> count($tablePrefixes[$left]);
+            return $byCount !== 0 ? $byCount : strnatcasecmp($left, $right);
+        });
 
         $publicGroups = [];
         foreach ($pluginGroups as $group) {
@@ -147,6 +157,9 @@ final class WordPressSqlInspector
         }
 
         return [
+            'table_prefixes' => array_map(static function (string $prefix, array $tables): array {
+                return ['value' => $prefix, 'tables' => count($tables)];
+            }, array_keys($tablePrefixes), array_values($tablePrefixes)),
             'admin_emails' => array_map(static function (string $email, array $labels): array {
                 return ['value' => $email, 'labels' => array_keys($labels)];
             }, array_keys($emailLabels), array_values($emailLabels)),

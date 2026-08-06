@@ -36,6 +36,8 @@ file_put_contents($input, $sql);
 
 try {
     $inspection = (new WordPressSqlInspector())->inspect($input);
+    assert($inspection['table_prefixes'][0]['value'] === 'wp_sembawp');
+    assert($inspection['table_prefixes'][0]['tables'] === 3);
     assert(count($inspection['admin_emails']) === 1);
     assert($inspection['admin_emails'][0]['value'] === 'admin@example.com');
     assert(in_array('管理者ユーザー: admin', $inspection['admin_emails'][0]['labels'], true));

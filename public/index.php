@@ -105,6 +105,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             if ($errors === []) {
                 try {
                     $inspection = inspectSqlFile($inputPath);
+                    validateDetectedTablePrefix($inspection, $sourcePrefix, $errors);
                     [$emailReplacements, $imagePathReplacements, $pluginOverrides] = requestedWordPressChanges($inspection, $errors);
                     if ($errors === []) {
                         $result = runDryRunAndBackup(
@@ -261,7 +262,7 @@ function handleSqlInspection(): void
 function inspectSqlFile(string $path): array
 {
     $name = basename($path);
-    $fingerprint = '2:' . (string) filesize($path) . ':' . (string) filemtime($path);
+    $fingerprint = '3:' . (string) filesize($path) . ':' . (string) filemtime($path);
     $cached = $_SESSION['sql_inspections'][$name] ?? null;
     if (is_array($cached) && ($cached['fingerprint'] ?? '') === $fingerprint && is_array($cached['data'] ?? null)) {
         return $cached['data'];
@@ -284,10 +285,26 @@ function publicInspection(array $inspection): array
         $groups[] = ['id' => (string) $group['id'], 'label' => (string) $group['label'], 'plugins' => $plugins];
     }
     return [
+        'table_prefixes' => $inspection['table_prefixes'] ?? [],
         'admin_emails' => $inspection['admin_emails'] ?? [],
         'image_paths' => $inspection['image_paths'] ?? [],
         'plugin_groups' => $groups,
     ];
+}
+
+/** @param array<string,mixed> $inspection @param list<string> $errors */
+function validateDetectedTablePrefix(array $inspection, string $sourcePrefix, array &$errors): void
+{
+    if ($sourcePrefix === '') {
+        return;
+    }
+    $detected = array_map(static function (array $item): string {
+        return (string) ($item['value'] ?? '');
+    }, $inspection['table_prefixes'] ?? []);
+    $detected = array_values(array_filter($detected, static function (string $prefix): bool { return $prefix !== ''; }));
+    if ($detected !== [] && !in_array($sourcePrefix, $detected, true)) {
+        $errors[] = '変更前の接頭辞がSQL内のWordPressテーブルと一致しません。検出値「' . implode('」「', $detected) . '」を使用してください。';
+    }
 }
 
 /**

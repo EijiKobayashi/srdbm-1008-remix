@@ -7,6 +7,8 @@ const uploadStatus = document.querySelector('#upload-status');
 const dropZone = document.querySelector('#drop-zone');
 const sqlSelect = document.querySelector('#sql_file');
 const chunkedSqlFile = document.querySelector('#chunked_sql_file');
+const sourcePrefix = document.querySelector('#source_prefix');
+const destinationPrefix = document.querySelector('#destination_prefix');
 const inspectionEmpty = document.querySelector('#inspection-empty');
 const inspectionLoading = document.querySelector('#inspection-loading');
 const inspectionResults = document.querySelector('#inspection-results');
@@ -44,6 +46,29 @@ const settingBlock = (title, description, count) => {
 
 const renderInspection = (inspection) => {
     inspectionResults.replaceChildren();
+
+    const prefixes = Array.isArray(inspection.table_prefixes) ? inspection.table_prefixes : [];
+    const prefixBlock = settingBlock('テーブル接頭辞', 'SQLから検出した正確な接頭辞です。変更する場合は、この値を「変更前」に設定してください。', prefixes.length);
+    const prefixList = element('div', 'space-y-2');
+    if (prefixes.length === 0) {
+        prefixList.append(element('p', 'text-sm text-wp-muted', 'WordPressのテーブル接頭辞は検出されませんでした。'));
+    }
+    prefixes.forEach((item, index) => {
+        const row = element('div', 'flex flex-col gap-3 rounded-sm bg-[#f6f7f7] p-3 sm:flex-row sm:items-center');
+        const valueWrap = element('div', 'min-w-0 flex-1');
+        valueWrap.append(element('code', 'break-all text-sm font-semibold text-wp-ink', item.value));
+        valueWrap.append(element('p', 'mt-1 text-xs text-wp-muted', `WordPress基本テーブル ${Number(item.tables || 0)}件で検出`));
+        const applyButton = element('button', 'btn secondary shrink-0', '変更前へ設定');
+        applyButton.type = 'button';
+        applyButton.addEventListener('click', () => {
+            sourcePrefix.value = item.value;
+            destinationPrefix.focus();
+        });
+        row.append(valueWrap, applyButton);
+        prefixList.append(row);
+        if (index === 0 && sourcePrefix && !sourcePrefix.value) sourcePrefix.placeholder = item.value;
+    });
+    prefixBlock.append(prefixList);
 
     const emails = Array.isArray(inspection.admin_emails) ? inspection.admin_emails : [];
     const emailBlock = settingBlock('管理者メールアドレス', '変更する場合だけ右側を書き換えてください。同じ値のままなら変更しません。', emails.length);
@@ -125,7 +150,7 @@ const renderInspection = (inspection) => {
         pluginBlock.append(groupWrap);
     });
 
-    inspectionResults.append(emailBlock, pathBlock, pluginBlock);
+    inspectionResults.append(prefixBlock, emailBlock, pathBlock, pluginBlock);
     inspectionEmpty.classList.add('hidden');
     inspectionLoading.classList.add('hidden');
     inspectionLoading.classList.remove('flex');
