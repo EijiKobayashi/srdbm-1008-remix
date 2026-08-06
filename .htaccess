@@ -1,0 +1,9 @@
+Options -Indexes
+DirectoryIndex index.php
+RewriteEngine On
+
+# 公開を許可するのはUI本体と静的ファイルだけです。
+RewriteRule ^$ index.php [L]
+RewriteRule ^index\.php$ - [END]
+RewriteRule ^assets/(.*)$ public/assets/$1 [END]
+RewriteRule ^ - [F]

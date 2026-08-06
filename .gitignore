@@ -16,3 +16,8 @@
 *.log
 *.tmp
 *.swp
+
+# SRDBM local configuration and third-party source
+/config/srdbm.php
+/vendor/Search-Replace-DB/
+/sql/output/*.sql

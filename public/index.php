@@ -1,0 +1,353 @@
+<?php
+
+declare(strict_types=1);
+
+use Srdbm\SqlDumpReplacer;
+
+session_set_cookie_params(['httponly' => true, 'samesite' => 'Strict', 'secure' => isset($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off']);
+session_start();
+set_time_limit(0);
+
+const APP_ROOT = __DIR__ . '/..';
+const INPUT_DIR = APP_ROOT . '/sql/input';
+const BACKUP_DIR = APP_ROOT . '/sql/backups';
+const OUTPUT_DIR = APP_ROOT . '/sql/output';
+const MAX_SQL_UPLOAD_BYTES = 524288000;
+
+require APP_ROOT . '/src/SqlDumpReplacer.php';
+
+if (!isset($_SESSION['csrf_token'])) {
+    $_SESSION['csrf_token'] = bin2hex(random_bytes(32));
+}
+
+foreach ([INPUT_DIR, BACKUP_DIR, OUTPUT_DIR] as $directory) {
+    if (!is_dir($directory)) {
+        @mkdir($directory, 0775, true);
+    }
+}
+
+if (isset($_GET['chunk_upload'])) {
+    handleChunkUpload();
+}
+
+if (isset($_GET['download']) && is_string($_GET['download'])) {
+    downloadOutput($_GET['download']);
+}
+
+$config = loadConfig();
+$sourceUrl = postValue('source_url', (string) ($config['source_url'] ?? 'http://'));
+$destinationUrl = postValue('destination_url', (string) ($config['destination_url'] ?? 'https://'));
+$sourcePrefix = postValue('source_prefix', (string) ($config['source_prefix'] ?? ''));
+$destinationPrefix = postValue('destination_prefix', (string) ($config['destination_prefix'] ?? ''));
+$selectedFile = postValue('sql_file', '');
+$errors = [];
+$result = null;
+
+if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+    $contentLength = (int) ($_SERVER['CONTENT_LENGTH'] ?? 0);
+    if ($_POST === [] && $contentLength > 0) {
+        $errors[] = '送信容量がサーバー上限を超えました。PHPとWebサーバーの上限を500MB以上にしてください。';
+    } elseif (!hash_equals((string) $_SESSION['csrf_token'], (string) ($_POST['csrf_token'] ?? ''))) {
+        $errors[] = '画面の有効期限が切れました。再読み込みしてください。';
+    } else {
+        $action = (string) ($_POST['action'] ?? '');
+        $forceHttps = isset($_POST['force_https']);
+        if (!in_array($action, ['dry-run', 'execute'], true)) {
+            $errors[] = '実行モードが正しくありません。';
+        }
+        if ($sourceUrl === '' || filter_var($sourceUrl, FILTER_VALIDATE_URL) === false) {
+            $errors[] = '置換元URLを正しく入力してください。';
+        }
+        if ($destinationUrl === '' || filter_var($destinationUrl, FILTER_VALIDATE_URL) === false) {
+            $errors[] = '置換後URLを正しく入力してください。';
+        }
+        if ($forceHttps) {
+            $destinationUrl = preg_replace('#^http://#i', 'https://', $destinationUrl) ?? $destinationUrl;
+        }
+        if ($sourceUrl === $destinationUrl) {
+            $errors[] = '置換元と置換後が同じです。';
+        }
+        if (($sourcePrefix === '') !== ($destinationPrefix === '')) {
+            $errors[] = '接頭辞を変更する場合は、変更前と変更後の両方を入力してください。';
+        }
+        foreach (['変更前の接頭辞' => $sourcePrefix, '変更後の接頭辞' => $destinationPrefix] as $label => $prefix) {
+            if ($prefix !== '' && preg_match('/^[A-Za-z0-9_]+$/', $prefix) !== 1) {
+                $errors[] = "{$label}は半角英数字とアンダースコアで入力してください。";
+            }
+        }
+        if ($sourcePrefix !== '' && $sourcePrefix === $destinationPrefix) {
+            $errors[] = '変更前と変更後の接頭辞が同じです。';
+        }
+        if ($action === 'execute' && !isset($_POST['confirm_backup'])) {
+            $errors[] = '本番変換前のバックアップ確認にチェックしてください。';
+        }
+
+        $inputPath = resolveChunkedSql(postValue('chunked_sql_file', ''), $errors);
+        if ($inputPath === '') {
+            $inputPath = receiveSqlUpload($errors);
+        }
+        if ($inputPath === '') {
+            $inputPath = resolveSelectedSql($selectedFile, $errors);
+        } else {
+            $selectedFile = basename($inputPath);
+        }
+
+        if ($errors === []) {
+            try {
+                $result = runReplacement($inputPath, $sourceUrl, $destinationUrl, $sourcePrefix, $destinationPrefix, $action === 'dry-run');
+            } catch (Throwable $error) {
+                $errors[] = $error->getMessage();
+            }
+        }
+    }
+}
+
+$sqlFiles = listFiles(INPUT_DIR);
+$outputFiles = array_slice(listFiles(OUTPUT_DIR), 0, 5);
+$preflight = [
+    ['label' => 'PHP 7.4+', 'ready' => version_compare(PHP_VERSION, '7.4.0', '>=')],
+    ['label' => 'SQL入力フォルダ', 'ready' => is_writable(INPUT_DIR)],
+    ['label' => 'バックアップフォルダ', 'ready' => is_writable(BACKUP_DIR)],
+    ['label' => '出力フォルダ', 'ready' => is_writable(OUTPUT_DIR)],
+    ['label' => '分割アップロード 500MB', 'ready' => is_writable(INPUT_DIR)],
+];
+$readyCount = count(array_filter($preflight, static function (array $item): bool { return $item['ready']; }));
+
+/** @return array<string, mixed> */
+function loadConfig(): array
+{
+    $path = APP_ROOT . '/config/srdbm.php';
+    if (!is_file($path)) {
+        return [];
+    }
+    $config = require $path;
+    return is_array($config) ? $config : [];
+}
+
+function postValue(string $key, string $default): string
+{
+    $value = $_POST[$key] ?? $default;
+    return is_string($value) ? trim($value) : $default;
+}
+
+function handleChunkUpload(): void
+{
+    header('Content-Type: application/json; charset=UTF-8');
+    $fail = static function (string $message, int $status = 400): void {
+        http_response_code($status);
+        echo json_encode(['ok' => false, 'message' => $message], JSON_UNESCAPED_UNICODE);
+        exit;
+    };
+
+    if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
+        $fail('POST required.', 405);
+    }
+    if (!hash_equals((string) $_SESSION['csrf_token'], (string) ($_POST['csrf_token'] ?? ''))) {
+        $fail('画面を再読み込みしてください。', 403);
+    }
+    $uploadId = (string) ($_POST['upload_id'] ?? '');
+    $filename = (string) ($_POST['filename'] ?? '');
+    $offset = filter_var($_POST['offset'] ?? null, FILTER_VALIDATE_INT);
+    $isLast = ($_POST['is_last'] ?? '') === '1';
+    if (preg_match('/^[a-f0-9]{32}$/', $uploadId) !== 1 || $offset === false || $offset < 0) {
+        $fail('アップロード情報が正しくありません。');
+    }
+    if (strtolower((string) pathinfo($filename, PATHINFO_EXTENSION)) !== 'sql') {
+        $fail('.sql ファイルを選択してください。');
+    }
+    if (!isset($_FILES['chunk']) || (int) $_FILES['chunk']['error'] !== UPLOAD_ERR_OK) {
+        $fail('分割データを受信できませんでした。');
+    }
+
+    $chunkDir = INPUT_DIR . '/.chunks';
+    if (!is_dir($chunkDir) && !mkdir($chunkDir, 0775, true) && !is_dir($chunkDir)) {
+        $fail('一時保存先を作成できません。', 500);
+    }
+    $partPath = $chunkDir . '/' . $uploadId . '.part';
+    $currentSize = is_file($partPath) ? (int) filesize($partPath) : 0;
+    if ($currentSize !== $offset) {
+        $fail('アップロード位置が一致しません。最初からやり直してください。', 409);
+    }
+
+    $source = fopen((string) $_FILES['chunk']['tmp_name'], 'rb');
+    $target = fopen($partPath, 'ab');
+    if ($source === false || $target === false || !flock($target, LOCK_EX)) {
+        if (is_resource($source)) fclose($source);
+        if (is_resource($target)) fclose($target);
+        $fail('分割データを保存できません。', 500);
+    }
+    stream_copy_to_stream($source, $target);
+    fflush($target);
+    flock($target, LOCK_UN);
+    fclose($source);
+    fclose($target);
+
+    $newSize = (int) filesize($partPath);
+    if ($newSize > MAX_SQL_UPLOAD_BYTES) {
+        @unlink($partPath);
+        $fail('SQLファイルが500MBを超えています。');
+    }
+    if (!$isLast) {
+        echo json_encode(['ok' => true, 'offset' => $newSize]);
+        exit;
+    }
+
+    $base = safeName(pathinfo($filename, PATHINFO_FILENAME));
+    $finalName = $base . '-' . date('Ymd-His') . '-' . bin2hex(random_bytes(2)) . '.sql';
+    if (!rename($partPath, INPUT_DIR . '/' . $finalName)) {
+        $fail('SQLファイルを確定できません。', 500);
+    }
+    echo json_encode(['ok' => true, 'filename' => $finalName], JSON_UNESCAPED_UNICODE);
+    exit;
+}
+
+/** @param list<string> $errors */
+function resolveChunkedSql(string $name, array &$errors): string
+{
+    if ($name === '') {
+        return '';
+    }
+    return resolveSelectedSql($name, $errors);
+}
+
+/** @param list<string> $errors */
+function receiveSqlUpload(array &$errors): string
+{
+    if (!isset($_FILES['sql_upload']) || (int) $_FILES['sql_upload']['error'] === UPLOAD_ERR_NO_FILE) {
+        return '';
+    }
+    $upload = $_FILES['sql_upload'];
+    if ((int) $upload['error'] !== UPLOAD_ERR_OK) {
+        $errors[] = in_array((int) $upload['error'], [UPLOAD_ERR_INI_SIZE, UPLOAD_ERR_FORM_SIZE], true)
+            ? 'SQLファイルが500MBの上限を超えています。'
+            : 'SQLファイルをアップロードできませんでした。';
+        return '';
+    }
+    $name = (string) $upload['name'];
+    $size = (int) $upload['size'];
+    if (strtolower((string) pathinfo($name, PATHINFO_EXTENSION)) !== 'sql') {
+        $errors[] = 'アップロードできるファイルは .sql のみです。';
+        return '';
+    }
+    if ($size <= 0 || $size > MAX_SQL_UPLOAD_BYTES) {
+        $errors[] = 'SQLファイルは1バイト以上500MB以下にしてください。';
+        return '';
+    }
+    $base = safeName(pathinfo($name, PATHINFO_FILENAME));
+    $path = INPUT_DIR . '/' . $base . '-' . date('Ymd-His') . '-' . bin2hex(random_bytes(2)) . '.sql';
+    if (!move_uploaded_file((string) $upload['tmp_name'], $path)) {
+        $errors[] = 'SQLファイルを保存できませんでした。';
+        return '';
+    }
+    return $path;
+}
+
+/** @param list<string> $errors */
+function resolveSelectedSql(string $name, array &$errors): string
+{
+    if ($name === '') {
+        $errors[] = 'SQLファイルを選択またはアップロードしてください。';
+        return '';
+    }
+    $safe = basename($name);
+    $path = INPUT_DIR . '/' . $safe;
+    if ($safe !== $name || !is_file($path) || strtolower((string) pathinfo($path, PATHINFO_EXTENSION)) !== 'sql') {
+        $errors[] = '選択されたSQLファイルがありません。';
+        return '';
+    }
+    return $path;
+}
+
+/** @return array{changes:int,url_changes:int,prefix_changes:int,bytes:int,elapsed:float,dry_run:bool,output:string,backup:string} */
+function runReplacement(string $input, string $search, string $replace, string $prefixSearch, string $prefixReplace, bool $dryRun): array
+{
+    $base = safeName(pathinfo($input, PATHINFO_FILENAME));
+    $suffix = date('Ymd-His') . '-' . bin2hex(random_bytes(2));
+    $outputName = $base . '-replaced-' . $suffix . '.sql';
+    $output = OUTPUT_DIR . '/' . $outputName;
+    $working = $dryRun ? tempnam(sys_get_temp_dir(), 'srdbm-dry-') : $output . '.part';
+    if ($working === false) {
+        throw new RuntimeException('一時ファイルを作成できません。');
+    }
+
+    try {
+        $report = (new SqlDumpReplacer())->process($input, $working, $search, $replace, $prefixSearch, $prefixReplace);
+        if ($dryRun) {
+            unlink($working);
+            return $report + ['dry_run' => true, 'output' => '', 'backup' => ''];
+        }
+
+        $backupName = $base . '-original-' . $suffix . '.sql';
+        $backup = BACKUP_DIR . '/' . $backupName;
+        if (!copy($input, $backup) || !is_file($backup) || filesize($backup) !== filesize($input)) {
+            @unlink($working);
+            @unlink($backup);
+            throw new RuntimeException('元SQLのバックアップに失敗したため、出力を中止しました。');
+        }
+        if (!rename($working, $output)) {
+            @unlink($working);
+            throw new RuntimeException('変換済みSQLを確定できません。');
+        }
+        return $report + ['dry_run' => false, 'output' => $outputName, 'backup' => $backupName];
+    } catch (Throwable $error) {
+        @unlink($working);
+        throw $error;
+    }
+}
+
+function downloadOutput(string $name): void
+{
+    $safe = basename($name);
+    $path = OUTPUT_DIR . '/' . $safe;
+    if ($safe !== $name || !is_file($path) || strtolower((string) pathinfo($path, PATHINFO_EXTENSION)) !== 'sql') {
+        http_response_code(404);
+        exit('File not found.');
+    }
+    header('Content-Type: application/sql');
+    header('Content-Disposition: attachment; filename="' . addcslashes($safe, '"\\') . '"');
+    header('Content-Length: ' . filesize($path));
+    header('X-Content-Type-Options: nosniff');
+    readfile($path);
+    exit;
+}
+
+/** @return list<string> */
+function listFiles(string $directory): array
+{
+    $files = glob($directory . '/*.[sS][qQ][lL]') ?: [];
+    usort($files, static function (string $a, string $b): int { return filemtime($b) <=> filemtime($a); });
+    return $files;
+}
+
+function safeName(string $value): string { return preg_replace('/[^A-Za-z0-9_.-]+/', '-', $value) ?: 'database'; }
+function e(string $value): string { return htmlspecialchars($value, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8'); }
+function fileSizeLabel(string $path): string { $bytes = filesize($path) ?: 0; return $bytes >= 1048576 ? number_format($bytes / 1048576, 1) . ' MB' : number_format($bytes / 1024, 1) . ' KB'; }
+function iniBytes(string $value): int { $number = (float) $value; $unit = strtolower(substr(trim($value), -1)); return $unit === 'g' ? (int) ($number * 1073741824) : ($unit === 'm' ? (int) ($number * 1048576) : ($unit === 'k' ? (int) ($number * 1024) : (int) $number)); }
+?>
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="robots" content="noindex,nofollow"><title>SRDBM 1008 REMIX</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<script>tailwind.config={theme:{extend:{colors:{wp:{ink:'#1d2327',blue:'#3858e9',canvas:'#f0f0f1',line:'#dcdcde',muted:'#646970',success:'#008a20',danger:'#d63638'}},boxShadow:{wp:'0 1px 1px rgba(0,0,0,.04)'},fontFamily:{sans:['-apple-system','BlinkMacSystemFont','Segoe UI','sans-serif']}}}}</script>
+<style type="text/tailwindcss">@layer base{body{@apply bg-wp-canvas text-wp-ink antialiased}input[type=text],input[type=url],select{@apply h-10 w-full rounded-sm border border-[#8c8f94] bg-white px-3 text-sm shadow-inner outline-none focus:border-wp-blue focus:ring-1 focus:ring-wp-blue}input[type=checkbox]{@apply h-4 w-4 rounded-sm border-[#8c8f94] text-wp-blue focus:ring-wp-blue}}@layer components{.panel{@apply border border-wp-line bg-white shadow-wp}.label{@apply mb-1.5 block text-sm font-medium}.help{@apply mt-1.5 text-xs leading-5 text-wp-muted}.btn{@apply inline-flex h-10 items-center justify-center rounded-sm border px-4 text-sm font-semibold focus:outline-none focus:ring-2 focus:ring-wp-blue focus:ring-offset-2}.primary{@apply border-wp-blue bg-wp-blue text-white hover:bg-[#2145e6]}.secondary{@apply border-wp-blue bg-white text-wp-blue hover:bg-[#f0f3ff]}}</style>
+</head>
+<body class="min-h-screen text-[14px]">
+<div id="loading" class="fixed inset-0 z-50 hidden items-center justify-center bg-white/80 backdrop-blur-sm"><div class="text-center"><div class="mx-auto mb-4 h-8 w-8 animate-spin rounded-full border-2 border-wp-line border-t-wp-blue"></div><p class="font-semibold">SQLを処理しています</p><p class="mt-1 text-xs text-wp-muted">画面を閉じずにお待ちください。</p></div></div>
+<header class="fixed inset-x-0 top-0 z-40 flex h-12 items-center bg-wp-ink text-white"><div class="flex h-12 w-60 items-center gap-3 border-r border-white/10 px-4"><span class="grid h-7 w-7 place-items-center rounded-full border border-white/70 font-serif font-bold">S</span><span class="font-semibold">SRDBM 1008</span></div><p class="px-4 text-xs text-white/60">SQL File Migration Workspace</p></header>
+<aside class="fixed bottom-0 left-0 top-12 hidden w-60 bg-[#23282d] text-[#c3c4c7] lg:block"><nav class="py-3"><a class="flex h-11 items-center gap-3 border-l-4 border-[#72aee6] bg-white/10 px-4 text-white" href="#replace"><span>↔</span><span class="font-medium">SQL置換</span></a><a class="flex h-11 items-center gap-3 px-5 hover:bg-white/5" href="#files"><span>▤</span><span>SQLファイル</span></a><a class="flex h-11 items-center gap-3 px-5 hover:bg-white/5" href="#outputs"><span>⇩</span><span>変換済みSQL</span></a></nav><div class="absolute bottom-0 p-4 text-xs leading-5 text-white/50">DB接続なし<br>SRDBM 1008 REMIX v0.0.1</div></aside>
+<main class="pt-12 lg:pl-60"><div class="mx-auto max-w-[1180px] px-4 py-8 sm:px-8">
+<div class="mb-7"><p class="mb-2 text-xs text-wp-muted">ツール › SQLファイル変換</p><h1 class="text-[28px] font-semibold tracking-tight">SQLを安全に置換</h1><p class="mt-2 max-w-2xl leading-6 text-wp-muted">データベースへ接続せず、SQLダンプを直接変換します。元SQLは保持され、シリアライズデータの文字数も自動調整されます。</p></div>
+<?php if ($errors !== []): ?><div class="mb-6 border-l-4 border-wp-danger bg-white p-4" role="alert"><p class="font-semibold text-wp-danger">確認が必要です</p><ul class="mt-2 list-disc space-y-1 pl-5"><?php foreach ($errors as $error): ?><li><?= e($error) ?></li><?php endforeach; ?></ul></div><?php endif; ?>
+<?php if ($result !== null): ?><section class="panel mb-6 p-5"><p class="text-xs font-semibold uppercase tracking-wide text-wp-success">Completed</p><h2 class="mt-1 text-lg font-semibold"><?= $result['dry_run'] ? 'ドライラン完了' : '変換完了' ?></h2><div class="mt-4 grid gap-3 sm:grid-cols-4"><div class="bg-[#f6f7f7] p-3"><span class="block text-xs text-wp-muted">URL変更</span><strong class="mt-1 block text-xl"><?= number_format($result['url_changes']) ?></strong></div><div class="bg-[#f6f7f7] p-3"><span class="block text-xs text-wp-muted">接頭辞変更</span><strong class="mt-1 block text-xl"><?= number_format($result['prefix_changes']) ?></strong></div><div class="bg-[#f6f7f7] p-3"><span class="block text-xs text-wp-muted">処理容量</span><strong class="mt-1 block text-xl"><?= e(fileSizeLabelFromBytes($result['bytes'])) ?></strong></div><div class="bg-[#f6f7f7] p-3"><span class="block text-xs text-wp-muted">処理時間</span><strong class="mt-1 block text-xl"><?= number_format($result['elapsed'], 2) ?>秒</strong></div></div><?php if (!$result['dry_run']): ?><div class="mt-4 flex flex-wrap items-center gap-3"><a class="btn primary" href="?download=<?= rawurlencode($result['output']) ?>">変換済みSQLをダウンロード</a><span class="text-xs text-wp-muted">元SQLのバックアップ: <?= e($result['backup']) ?></span></div><?php endif; ?></section><?php endif; ?>
+<form id="replace" method="post" enctype="multipart/form-data" class="grid items-start gap-6 xl:grid-cols-[minmax(0,1fr)_310px]"><input type="hidden" name="csrf_token" value="<?= e((string) $_SESSION['csrf_token']) ?>"><input type="hidden" name="MAX_FILE_SIZE" value="<?= MAX_SQL_UPLOAD_BYTES ?>"><input type="hidden" id="chunked_sql_file" name="chunked_sql_file" value="">
+<div class="space-y-6">
+<section id="files" class="panel"><div class="border-b border-wp-line px-6 py-4"><div class="flex items-center gap-3"><span class="grid h-7 w-7 place-items-center rounded-full bg-[#e9ecff] text-xs font-bold text-wp-blue">1</span><h2 class="font-semibold">SQLファイル</h2></div></div><div class="space-y-5 p-6"><div><label class="label" for="sql_file">配置済みSQL</label><select id="sql_file" name="sql_file"><option value="">SQLファイルを選択</option><?php foreach ($sqlFiles as $file): $name = basename($file); ?><option value="<?= e($name) ?>" <?= $selectedFile === $name ? 'selected' : '' ?>><?= e($name) ?> — <?= e(fileSizeLabel($file)) ?></option><?php endforeach; ?></select><p class="help">`sql/input/` のファイルが表示されます。</p></div><div class="flex items-center gap-3 text-xs text-wp-muted"><span class="h-px flex-1 bg-wp-line"></span>または<span class="h-px flex-1 bg-wp-line"></span></div><label id="drop-zone" for="sql_upload" class="flex cursor-pointer flex-col items-center border-2 border-dashed border-[#a7aaad] bg-[#fafafa] px-5 py-8 text-center hover:border-wp-blue"><span class="mb-3 grid h-10 w-10 place-items-center rounded-full bg-white text-xl shadow-sm">⇧</span><span id="upload-label" class="font-semibold text-wp-blue">SQLファイルを選択</span><span class="mt-1 text-xs text-wp-muted">またはドロップ（.sql / 最大500MB）</span><input id="sql_upload" name="sql_upload" type="file" accept=".sql,application/sql,text/plain" class="sr-only"></label></div></section>
+<section class="panel"><div class="border-b border-wp-line px-6 py-4"><div class="flex items-center gap-3"><span class="grid h-7 w-7 place-items-center rounded-full bg-[#e9ecff] text-xs font-bold text-wp-blue">2</span><h2 class="font-semibold">置換ルール</h2></div></div><div class="grid gap-5 p-6 sm:grid-cols-[1fr_auto_1fr] sm:items-end"><div><label class="label" for="source_url">置換元URL</label><input id="source_url" name="source_url" type="url" value="<?= e($sourceUrl) ?>" required></div><span class="hidden h-10 items-center text-xl text-wp-muted sm:flex">→</span><div><label class="label" for="destination_url">置換後URL</label><input id="destination_url" name="destination_url" type="url" value="<?= e($destinationUrl) ?>" required></div><label class="flex items-start gap-3 sm:col-span-3"><input name="force_https" type="checkbox" class="mt-0.5" <?= !isset($_POST['csrf_token']) || isset($_POST['force_https']) ? 'checked' : '' ?>><span><span class="block font-medium">置換後URLをHTTPSに統一</span><span class="help mt-0">http:// の場合もhttps://へ補正します。</span></span></label><div class="border-t border-wp-line pt-5 sm:col-span-3"><div class="mb-3 flex items-center gap-2"><span class="font-medium">テーブル接頭辞の変更</span><span class="rounded-full bg-[#f0f0f1] px-2 py-0.5 text-[11px] text-wp-muted">任意</span></div><div class="grid gap-5 sm:grid-cols-[1fr_auto_1fr] sm:items-end"><div><label class="label" for="source_prefix">変更前</label><input id="source_prefix" name="source_prefix" type="text" value="<?= e($sourcePrefix) ?>" placeholder="wp_" pattern="[A-Za-z0-9_]+"></div><span class="hidden h-10 items-center text-xl text-wp-muted sm:flex">→</span><div><label class="label" for="destination_prefix">変更後</label><input id="destination_prefix" name="destination_prefix" type="text" value="<?= e($destinationPrefix) ?>" placeholder="renewal_" pattern="[A-Za-z0-9_]+"></div></div><p class="help">テーブル名、user_roles、capabilities、シリアライズ済み設定内の接頭辞をまとめて変更します。</p></div></div></section>
+<section class="panel border-l-4 border-l-[#f0b849] p-5"><label class="flex items-start gap-3"><input name="confirm_backup" type="checkbox" class="mt-0.5" <?= isset($_POST['confirm_backup']) ? 'checked' : '' ?>><span><span class="block font-semibold">元SQLのバックアップ作成を確認しました</span><span class="help">本番変換時は元ファイルを `sql/backups/` に保存してから出力します。</span></span></label></section>
+<div class="sticky bottom-0 z-20 flex flex-col-reverse justify-between gap-3 border border-wp-line bg-white/95 p-4 shadow-lg sm:flex-row sm:items-center"><p class="text-xs text-wp-muted">最初はドライランで変更件数を確認してください。</p><div class="flex gap-3"><button class="btn secondary" type="submit" name="action" value="dry-run">ドライラン</button><button class="btn primary" type="submit" name="action" value="execute">バックアップして変換</button></div></div>
+</div>
+<aside class="space-y-6 xl:sticky xl:top-20"><section class="panel p-5"><div class="mb-4 flex justify-between"><h2 class="font-semibold">実行環境</h2><span class="text-xs font-semibold <?= $readyCount === count($preflight) ? 'text-wp-success' : 'text-[#996800]' ?>"><?= $readyCount ?>/<?= count($preflight) ?> READY</span></div><ul class="space-y-3"><?php foreach ($preflight as $item): ?><li class="flex justify-between"><span><?= e($item['label']) ?></span><span class="grid h-5 w-5 place-items-center rounded-full text-xs <?= $item['ready'] ? 'bg-[#edfaef] text-wp-success' : 'bg-[#fcf0f1] text-wp-danger' ?>"><?= $item['ready'] ? '✓' : '!' ?></span></li><?php endforeach; ?></ul></section><section id="outputs" class="panel p-5"><h2 class="font-semibold">最近の変換済みSQL</h2><?php if ($outputFiles === []): ?><p class="mt-3 text-xs text-wp-muted">まだ出力はありません。</p><?php else: ?><ul class="mt-3 divide-y divide-wp-line"><?php foreach ($outputFiles as $file): ?><li class="py-3"><a class="block truncate text-sm font-medium text-wp-blue" href="?download=<?= rawurlencode(basename($file)) ?>"><?= e(basename($file)) ?></a><span class="text-xs text-wp-muted"><?= e(fileSizeLabel($file)) ?></span></li><?php endforeach; ?></ul><?php endif; ?></section><div class="border border-[#c5d9ed] bg-[#f0f6fc] p-4 text-xs leading-5"><strong class="block">DB接続は不要です</strong>SQLファイルだけを読み書きし、データベースには接続しません。</div></aside>
+</form></div></main><script src="assets/app.js"></script></body></html>
+<?php
+function fileSizeLabelFromBytes(int $bytes): string { return $bytes >= 1048576 ? number_format($bytes / 1048576, 1) . ' MB' : number_format($bytes / 1024, 1) . ' KB'; }
