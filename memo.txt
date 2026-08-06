@@ -1,0 +1,15 @@
+# プロンプト
+
+前提、ダンプした SQL データをローカルで Search-Replace-DB-master の srdb.cli.php を使用して置換作業を行う。
+置換時にいろいろな作業を行ってもらう。
+名称は船場のリニューアル公開に伴い必要なツールとして開発するため（仮）Search-Replace-DB-master 1008 REMIX（SRDBM 1008 REMIX） ＝ srdbm-1008-remix とする。
+
+TODOリスト
+* 基本 Search-Replace-DB-master (https://github.com/interconnectit/Search-Replace-DB) 最新リポジトリを使用する
+* 置換元、置換後の情報を設定する（必須）
+* DB バックアップ（必須）
+* MySQL / MariaDB 両対応（必須）
+* DB 内の http -> https への置換を実行可能にする（必須）
+* DB 内の管理者メールアドレスを表示して変更を可能にする（任意）
+* DB 内の画像パスを表示して変更を可能にする（任意）
+* DB 内のプラグイン情報をリスト化して有効／無効化を設定を可能にする（任意）
