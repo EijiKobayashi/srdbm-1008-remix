@@ -11,9 +11,22 @@ final class SqlDumpReplacer
     /**
      * MySQLダンプ内の文字列リテラルを解析し、シリアライズデータを保ったまま置換する。
      *
-     * @return array{changes:int, url_changes:int, prefix_changes:int, bytes:int, elapsed:float}
+     * @param array<string,string> $emailReplacements
+     * @param array<string,string> $imagePathReplacements
+     * @param array<string,string> $literalOverrides
+     * @return array{changes:int, url_changes:int, prefix_changes:int, email_changes:int, image_changes:int, plugin_changes:int, bytes:int, elapsed:float}
      */
-    public function process(string $inputPath, string $outputPath, string $search, string $replace, string $prefixSearch = '', string $prefixReplace = ''): array
+    public function process(
+        string $inputPath,
+        string $outputPath,
+        string $search,
+        string $replace,
+        string $prefixSearch = '',
+        string $prefixReplace = '',
+        array $emailReplacements = [],
+        array $imagePathReplacements = [],
+        array $literalOverrides = []
+    ): array
     {
         if ($search === '') {
             throw new RuntimeException('置換元は空にできません。');
@@ -33,6 +46,9 @@ final class SqlDumpReplacer
         $changes = 0;
         $urlChanges = 0;
         $prefixChanges = 0;
+        $emailChanges = 0;
+        $imageChanges = 0;
+        $pluginChanges = 0;
         $bytes = 0;
         $inLiteral = false;
         $escapeNext = false;
@@ -62,7 +78,7 @@ final class SqlDumpReplacer
                         $literal .= "''";
                         $offset = 1;
                     } else {
-                        $this->writeLiteral($output, $literal, $search, $replace, $prefixSearch, $prefixReplace, $urlChanges, $prefixChanges);
+                        $this->writeLiteral($output, $literal, $search, $replace, $prefixSearch, $prefixReplace, $emailReplacements, $imagePathReplacements, $literalOverrides, $urlChanges, $prefixChanges, $emailChanges, $imageChanges, $pluginChanges);
                         fwrite($output, "'");
                         $inLiteral = false;
                         $literal = '';
@@ -131,7 +147,7 @@ final class SqlDumpReplacer
                         break;
                     }
 
-                    $this->writeLiteral($output, $literal, $search, $replace, $prefixSearch, $prefixReplace, $urlChanges, $prefixChanges);
+                    $this->writeLiteral($output, $literal, $search, $replace, $prefixSearch, $prefixReplace, $emailReplacements, $imagePathReplacements, $literalOverrides, $urlChanges, $prefixChanges, $emailChanges, $imageChanges, $pluginChanges);
                     fwrite($output, "'");
                     $literal = '';
                     $inLiteral = false;
@@ -140,7 +156,7 @@ final class SqlDumpReplacer
             }
 
             if ($pendingQuote) {
-                $this->writeLiteral($output, $literal, $search, $replace, $prefixSearch, $prefixReplace, $urlChanges, $prefixChanges);
+                $this->writeLiteral($output, $literal, $search, $replace, $prefixSearch, $prefixReplace, $emailReplacements, $imagePathReplacements, $literalOverrides, $urlChanges, $prefixChanges, $emailChanges, $imageChanges, $pluginChanges);
                 fwrite($output, "'");
                 $inLiteral = false;
             }
@@ -156,20 +172,56 @@ final class SqlDumpReplacer
             fclose($output);
         }
 
-        $changes = $urlChanges + $prefixChanges;
-        return ['changes' => $changes, 'url_changes' => $urlChanges, 'prefix_changes' => $prefixChanges, 'bytes' => $bytes, 'elapsed' => microtime(true) - $startedAt];
+        $changes = $urlChanges + $prefixChanges + $emailChanges + $imageChanges + $pluginChanges;
+        return [
+            'changes' => $changes,
+            'url_changes' => $urlChanges,
+            'prefix_changes' => $prefixChanges,
+            'email_changes' => $emailChanges,
+            'image_changes' => $imageChanges,
+            'plugin_changes' => $pluginChanges,
+            'bytes' => $bytes,
+            'elapsed' => microtime(true) - $startedAt,
+        ];
     }
 
     /** @param resource $output */
-    private function writeLiteral($output, string $raw, string $search, string $replace, string $prefixSearch, string $prefixReplace, int &$urlChanges, int &$prefixChanges): void
+    private function writeLiteral(
+        $output,
+        string $raw,
+        string $search,
+        string $replace,
+        string $prefixSearch,
+        string $prefixReplace,
+        array $emailReplacements,
+        array $imagePathReplacements,
+        array $literalOverrides,
+        int &$urlChanges,
+        int &$prefixChanges,
+        int &$emailChanges,
+        int &$imageChanges,
+        int &$pluginChanges
+    ): void
     {
         $decoded = $this->sqlUnescape($raw);
-        $before = $urlChanges + $prefixChanges;
-        $converted = $this->replaceValue($decoded, $search, $replace, $urlChanges);
+        $before = $urlChanges + $prefixChanges + $emailChanges + $imageChanges + $pluginChanges;
+        if (array_key_exists($decoded, $literalOverrides) && $literalOverrides[$decoded] !== $decoded) {
+            $decoded = $literalOverrides[$decoded];
+            $pluginChanges++;
+        }
+        $converted = $decoded;
+        foreach ($emailReplacements as $emailSearch => $emailReplace) {
+            $converted = $this->replaceValue($converted, $emailSearch, $emailReplace, $emailChanges);
+        }
+        foreach ($imagePathReplacements as $pathSearch => $pathReplace) {
+            $converted = $this->replaceValue($converted, $pathSearch, $pathReplace, $imageChanges);
+        }
+        $converted = $this->replaceValue($converted, $search, $replace, $urlChanges);
         if ($prefixSearch !== '') {
             $converted = $this->replaceValue($converted, $prefixSearch, $prefixReplace, $prefixChanges);
         }
-        fwrite($output, $urlChanges + $prefixChanges === $before ? $raw : $this->sqlEscape($converted));
+        $after = $urlChanges + $prefixChanges + $emailChanges + $imageChanges + $pluginChanges;
+        fwrite($output, $after === $before ? $raw : $this->sqlEscape($converted));
     }
 
     /** @param resource $output */

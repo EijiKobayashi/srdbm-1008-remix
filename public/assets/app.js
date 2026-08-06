@@ -7,6 +7,160 @@ const uploadStatus = document.querySelector('#upload-status');
 const dropZone = document.querySelector('#drop-zone');
 const sqlSelect = document.querySelector('#sql_file');
 const chunkedSqlFile = document.querySelector('#chunked_sql_file');
+const inspectionEmpty = document.querySelector('#inspection-empty');
+const inspectionLoading = document.querySelector('#inspection-loading');
+const inspectionResults = document.querySelector('#inspection-results');
+const dryRunButton = form?.querySelector('button[value="dry-run"]');
+
+let inspectionRequest = 0;
+
+const element = (tag, className = '', text = '') => {
+    const node = document.createElement(tag);
+    if (className) node.className = className;
+    if (text) node.textContent = text;
+    return node;
+};
+
+const resetInspection = (message = 'SQLのアップロード後に、検出したWordPress設定を表示します。') => {
+    inspectionRequest++;
+    inspectionEmpty.textContent = message;
+    inspectionEmpty.className = 'border border-dashed border-wp-line bg-[#fafafa] p-5 text-sm text-wp-muted';
+    inspectionEmpty.classList.remove('hidden');
+    inspectionLoading.classList.add('hidden');
+    inspectionLoading.classList.remove('flex');
+    inspectionResults.classList.add('hidden');
+    inspectionResults.replaceChildren();
+    if (dryRunButton) dryRunButton.disabled = Boolean(upload?.files?.[0]);
+};
+
+const settingBlock = (title, description, count) => {
+    const block = element('section', 'border-t border-wp-line pt-5 first:border-t-0 first:pt-0');
+    const heading = element('div', 'mb-3 flex flex-wrap items-center gap-2');
+    heading.append(element('h3', 'font-semibold', title));
+    heading.append(element('span', 'rounded-full bg-[#f0f0f1] px-2 py-0.5 text-[11px] text-wp-muted', `${count}件`));
+    block.append(heading, element('p', 'mb-4 text-xs leading-5 text-wp-muted', description));
+    return block;
+};
+
+const renderInspection = (inspection) => {
+    inspectionResults.replaceChildren();
+
+    const emails = Array.isArray(inspection.admin_emails) ? inspection.admin_emails : [];
+    const emailBlock = settingBlock('管理者メールアドレス', '変更する場合だけ右側を書き換えてください。同じ値のままなら変更しません。', emails.length);
+    const emailList = element('div', 'space-y-3');
+    if (emails.length === 0) {
+        emailList.append(element('p', 'text-sm text-wp-muted', '管理者メールアドレスは検出されませんでした。'));
+    }
+    emails.forEach((item) => {
+        const row = element('div', 'grid gap-2 rounded-sm bg-[#f6f7f7] p-3 sm:grid-cols-[minmax(0,1fr)_auto_minmax(0,1fr)] sm:items-center');
+        const originalWrap = element('div');
+        originalWrap.append(element('p', 'break-all text-sm font-medium', item.value));
+        originalWrap.append(element('p', 'mt-1 text-xs text-wp-muted', Array.isArray(item.labels) ? item.labels.join(' / ') : ''));
+        const hidden = document.createElement('input');
+        hidden.type = 'hidden';
+        hidden.name = 'email_original[]';
+        hidden.value = item.value;
+        const replacement = document.createElement('input');
+        replacement.type = 'email';
+        replacement.name = 'email_replacement[]';
+        replacement.value = item.value;
+        replacement.setAttribute('aria-label', `${item.value} の変更後メールアドレス`);
+        row.append(hidden, originalWrap, element('span', 'hidden text-wp-muted sm:block', '→'), replacement);
+        emailList.append(row);
+    });
+    emailBlock.append(emailList);
+
+    const paths = Array.isArray(inspection.image_paths) ? inspection.image_paths : [];
+    const pathBlock = settingBlock('画像パス', 'SQL内で検出したアップロード基点です。個別画像名ではなく、この基点をまとめて変更します。', paths.length);
+    const pathList = element('div', 'space-y-3');
+    if (paths.length === 0) {
+        pathList.append(element('p', 'text-sm text-wp-muted', '画像パスは検出されませんでした。'));
+    }
+    paths.forEach((item) => {
+        const row = element('div', 'grid gap-2 rounded-sm bg-[#f6f7f7] p-3 sm:grid-cols-[minmax(0,1fr)_auto_minmax(0,1fr)] sm:items-center');
+        const originalWrap = element('div');
+        originalWrap.append(element('p', 'break-all text-sm font-medium', item.value));
+        originalWrap.append(element('p', 'mt-1 text-xs text-wp-muted', `検出 ${Number(item.occurrences || 0).toLocaleString()}箇所`));
+        const hidden = document.createElement('input');
+        hidden.type = 'hidden';
+        hidden.name = 'image_path_original[]';
+        hidden.value = item.value;
+        const replacement = document.createElement('input');
+        replacement.type = 'text';
+        replacement.name = 'image_path_replacement[]';
+        replacement.value = item.value;
+        replacement.setAttribute('aria-label', `${item.value} の変更後画像パス`);
+        row.append(hidden, originalWrap, element('span', 'hidden text-wp-muted sm:block', '→'), replacement);
+        pathList.append(row);
+    });
+    pathBlock.append(pathList);
+
+    const groups = Array.isArray(inspection.plugin_groups) ? inspection.plugin_groups : [];
+    const pluginCount = new Set(groups.flatMap((group) => (group.plugins || []).map((plugin) => plugin.path))).size;
+    const pluginBlock = settingBlock('プラグイン', 'SQL内で確認できたプラグインです。チェックありを有効、チェックなしを無効として変換します。', pluginCount);
+    if (groups.length === 0) {
+        pluginBlock.append(element('p', 'text-sm text-wp-muted', 'プラグイン設定は検出されませんでした。'));
+    }
+    groups.forEach((group) => {
+        const groupWrap = element('fieldset', 'mb-4 rounded-sm border border-wp-line p-4 last:mb-0');
+        groupWrap.append(element('legend', 'px-1 text-sm font-semibold', group.label));
+        const present = document.createElement('input');
+        present.type = 'hidden';
+        present.name = 'plugin_groups_present[]';
+        present.value = group.id;
+        groupWrap.append(present);
+        const list = element('div', 'mt-2 grid gap-2 sm:grid-cols-2');
+        (group.plugins || []).forEach((plugin) => {
+            const label = element('label', 'flex items-start gap-2 rounded-sm bg-[#f6f7f7] p-3');
+            const checkbox = document.createElement('input');
+            checkbox.type = 'checkbox';
+            checkbox.name = `plugins[${group.id}][]`;
+            checkbox.value = plugin.path;
+            checkbox.checked = Boolean(plugin.active);
+            checkbox.className = 'mt-0.5';
+            label.append(checkbox, element('span', 'break-all text-sm', plugin.path));
+            list.append(label);
+        });
+        groupWrap.append(list);
+        pluginBlock.append(groupWrap);
+    });
+
+    inspectionResults.append(emailBlock, pathBlock, pluginBlock);
+    inspectionEmpty.classList.add('hidden');
+    inspectionLoading.classList.add('hidden');
+    inspectionLoading.classList.remove('flex');
+    inspectionResults.classList.remove('hidden');
+};
+
+const inspectSql = async (filename) => {
+    if (!filename) {
+        resetInspection();
+        return;
+    }
+    const requestId = ++inspectionRequest;
+    if (dryRunButton) dryRunButton.disabled = true;
+    inspectionEmpty.classList.add('hidden');
+    inspectionResults.classList.add('hidden');
+    inspectionLoading.classList.remove('hidden');
+    inspectionLoading.classList.add('flex');
+    const data = new FormData();
+    data.append('csrf_token', form.elements.csrf_token.value);
+    data.append('filename', filename);
+    try {
+        const response = await fetch('?inspect_sql=1', { method: 'POST', body: data, credentials: 'same-origin' });
+        const result = await response.json();
+        if (!response.ok || !result.ok) throw new Error(result.message || 'SQLの解析に失敗しました。');
+        if (requestId === inspectionRequest) renderInspection(result.inspection || {});
+    } catch (error) {
+        if (requestId !== inspectionRequest) return;
+        inspectionLoading.classList.add('hidden');
+        inspectionLoading.classList.remove('flex');
+        inspectionEmpty.textContent = error instanceof Error ? error.message : 'SQLの解析に失敗しました。';
+        inspectionEmpty.className = 'border border-wp-danger bg-[#fcf0f1] p-5 text-sm text-wp-danger';
+    } finally {
+        if (requestId === inspectionRequest && dryRunButton) dryRunButton.disabled = false;
+    }
+};
 
 const setUploadSelection = (file) => {
     chunkedSqlFile.value = '';
@@ -15,13 +169,14 @@ const setUploadSelection = (file) => {
     uploadStatus.textContent = `${file.name} を選択しました。「アップロードする」を押してください。`;
     uploadStatus.className = 'text-xs text-[#996800]';
     uploadButton.disabled = false;
+    resetInspection('アップロード完了後にWordPress設定を解析します。');
 };
 
 upload?.addEventListener('change', () => {
     if (upload.files.length > 0) setUploadSelection(upload.files[0]);
 });
 
-sqlSelect?.addEventListener('change', () => {
+sqlSelect?.addEventListener('change', async () => {
     upload.value = '';
     chunkedSqlFile.value = '';
     uploadButton.disabled = true;
@@ -29,9 +184,11 @@ sqlSelect?.addEventListener('change', () => {
         uploadLabel.textContent = 'SQLファイルを選択';
         uploadStatus.textContent = 'アップロード済みSQLを選択しています。ドライランへ進めます。';
         uploadStatus.className = 'text-xs font-medium text-wp-success';
+        await inspectSql(sqlSelect.value);
     } else {
         uploadStatus.textContent = 'ファイルを選択するとアップロードできます。';
         uploadStatus.className = 'text-xs text-wp-muted';
+        resetInspection();
     }
 });
 
@@ -98,6 +255,7 @@ uploadButton?.addEventListener('click', async () => {
     const uploadId = Array.from(crypto.getRandomValues(new Uint8Array(16)), (byte) => byte.toString(16).padStart(2, '0')).join('');
     let offset = 0;
 
+    let uploadedFilename = '';
     try {
         while (offset < file.size) {
             const end = Math.min(offset + chunkSize, file.size);
@@ -116,6 +274,7 @@ uploadButton?.addEventListener('click', async () => {
             if (!response.ok || !result.ok) throw new Error(result.message || 'アップロードに失敗しました。');
             offset = end;
             if (result.filename) {
+                uploadedFilename = result.filename;
                 chunkedSqlFile.value = result.filename;
                 const option = new Option(`${result.filename} — アップロード完了`, result.filename, true, true);
                 sqlSelect.add(option, 1);
@@ -125,6 +284,8 @@ uploadButton?.addEventListener('click', async () => {
         uploadLabel.textContent = file.name;
         uploadStatus.textContent = 'アップロードが完了しました。置換条件を入力してドライランへ進んでください。';
         uploadStatus.className = 'text-xs font-medium text-wp-success';
+        loadingTitle.textContent = 'WordPress設定を解析しています';
+        await inspectSql(uploadedFilename);
     } catch (error) {
         chunkedSqlFile.value = '';
         uploadStatus.textContent = error instanceof Error ? error.message : 'アップロードに失敗しました。';
@@ -163,3 +324,5 @@ document.querySelectorAll('[data-processing-form]').forEach((processingForm) => 
         loading.classList.add('flex');
     });
 });
+
+if (sqlSelect?.value) inspectSql(sqlSelect.value);
