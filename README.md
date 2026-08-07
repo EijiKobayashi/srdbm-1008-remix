@@ -1,6 +1,6 @@
 # SRDBM 1008 REMIX
 
-Current version: **v0.0.3**
+Current version: **v0.0.4**
 
 **Search-Replace-DB-master 1008 REMIX** は、WordPressなどのMySQL/MariaDBダンプをデータベースへ接続せず、SQLファイルのまま安全にURL置換するツールです。
 

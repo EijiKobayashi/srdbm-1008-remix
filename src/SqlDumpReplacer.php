@@ -92,9 +92,19 @@ final class SqlDumpReplacer
                         if ($quote === false) {
                             $outside = substr($chunk, $offset);
                             if ($prefixSearch !== '') {
-                                $carryLength = min(max(strlen($prefixSearch) - 1, 0), strlen($outside));
-                                $outsideCarry = $carryLength > 0 ? substr($outside, -$carryLength) : '';
-                                $outside = $carryLength > 0 ? substr($outside, 0, -$carryLength) : $outside;
+                                $searchLength = strlen($prefixSearch);
+                                $carryLength = min(max($searchLength - 1, 0), strlen($outside));
+                                $writeLength = strlen($outside) - $carryLength;
+                                $maxOverlap = min(max($searchLength - 1, 0), $writeLength);
+                                for ($overlap = $maxOverlap; $overlap > 0; $overlap--) {
+                                    if (substr($outside, $writeLength - $overlap, $overlap)
+                                        === substr($prefixSearch, 0, $overlap)) {
+                                        $writeLength -= $overlap;
+                                        break;
+                                    }
+                                }
+                                $outsideCarry = substr($outside, $writeLength);
+                                $outside = substr($outside, 0, $writeLength);
                             }
                             $this->writeOutside($output, $outside, $prefixSearch, $prefixReplace, $prefixChanges);
                             break;
@@ -172,6 +182,10 @@ final class SqlDumpReplacer
             fclose($output);
         }
 
+        if ($prefixSearch !== '' && $prefixSearch !== $prefixReplace) {
+            $this->validateOutputOrDiscard($outputPath, $prefixSearch, $prefixReplace);
+        }
+
         $changes = $urlChanges + $prefixChanges + $emailChanges + $imageChanges + $pluginChanges;
         return [
             'changes' => $changes,
@@ -183,6 +197,167 @@ final class SqlDumpReplacer
             'bytes' => $bytes,
             'elapsed' => microtime(true) - $startedAt,
         ];
+    }
+
+    private function validateOutputOrDiscard(string $path, string $prefixSearch, string $prefixReplace): void
+    {
+        try {
+            $this->assertNoStaleTablePrefix($path, $prefixSearch, $prefixReplace);
+        } catch (\Throwable $e) {
+            $discarded = !file_exists($path) || unlink($path);
+            $message = rtrim($e->getMessage(), '。') . '。';
+            $message .= $discarded
+                ? '出力SQLを破棄しました。'
+                : '不完全な出力SQLを破棄できませんでした。';
+            throw new RuntimeException($message, 0, $e);
+        }
+    }
+
+    private function assertNoStaleTablePrefix(string $path, string $prefixSearch, string $prefixReplace): void
+    {
+        $handle = fopen($path, 'rb');
+        if ($handle === false) {
+            throw new RuntimeException('変換後SQLの接頭辞を検証できません。');
+        }
+
+        $carry = '';
+        $inLiteral = false;
+        $escapeNext = false;
+        $pendingQuote = false;
+        $pattern = '/\b(?:CREATE\s+TABLE(?:\s+IF\s+NOT\s+EXISTS)?|DROP\s+TABLE(?:\s+IF\s+EXISTS)?|ALTER\s+TABLE|INSERT(?:\s+IGNORE)?\s+INTO|REPLACE\s+INTO|UPDATE|DELETE\s+FROM)\s+(?:(?:`[^`]+`|[A-Za-z0-9_$-]+)\s*\.\s*)?`?([A-Za-z0-9_$-]+)`?(?=[^A-Za-z0-9_$-]|$)/i';
+        try {
+            while (!feof($handle)) {
+                $chunk = fread($handle, 1048576);
+                if ($chunk === false) {
+                    throw new RuntimeException('変換後SQLの接頭辞検証中に読み込みが失敗しました。');
+                }
+                if ($chunk === '') {
+                    continue;
+                }
+                $sqlOnly = $this->maskSqlStringLiterals($chunk, $inLiteral, $escapeNext, $pendingQuote);
+                $buffer = $carry . $sqlOnly;
+                $carryStart = max(0, strlen($buffer) - 4096);
+                if (preg_match_all($pattern, $buffer, $matches, PREG_OFFSET_CAPTURE)) {
+                    foreach ($matches[1] as $index => [$table, $tableOffset]) {
+                        $tableEnd = $tableOffset + strlen($table);
+                        if (!feof($handle) && $tableEnd === strlen($buffer)) {
+                            // 識別子の途中でチャンクが切れた可能性があるため、次回まで判定を保留する。
+                            $carryStart = min($carryStart, $matches[0][$index][1]);
+                            continue;
+                        }
+                        if ($this->startsWith($table, $prefixSearch)
+                            && ($prefixReplace === '' || !$this->startsWith($table, $prefixReplace))) {
+                            throw new RuntimeException(
+                                "テーブル {$table} の接頭辞が変換されていません"
+                            );
+                        }
+                    }
+                }
+                $carry = substr($buffer, $carryStart);
+            }
+
+            // ファイルサイズがチャンク長の整数倍の場合、直前の判定で保留した
+            // ファイル末尾の識別子をここで確定する。
+            if ($carry !== '' && preg_match_all($pattern, $carry, $matches)) {
+                foreach ($matches[1] as $table) {
+                    if ($this->startsWith($table, $prefixSearch)
+                        && ($prefixReplace === '' || !$this->startsWith($table, $prefixReplace))) {
+                        throw new RuntimeException(
+                            "テーブル {$table} の接頭辞が変換されていません"
+                        );
+                    }
+                }
+            }
+        } finally {
+            fclose($handle);
+        }
+    }
+
+    private function maskSqlStringLiterals(
+        string $chunk,
+        bool &$inLiteral,
+        bool &$escapeNext,
+        bool &$pendingQuote
+    ): string
+    {
+        $masked = '';
+        $length = strlen($chunk);
+        $offset = 0;
+
+        if ($pendingQuote) {
+            if ($length > 0 && $chunk[0] === "'") {
+                $masked .= ' ';
+                $offset = 1;
+            } else {
+                $inLiteral = false;
+            }
+            $pendingQuote = false;
+        }
+
+        while ($offset < $length) {
+            if (!$inLiteral) {
+                $quote = strpos($chunk, "'", $offset);
+                if ($quote === false) {
+                    $masked .= substr($chunk, $offset);
+                    break;
+                }
+                $masked .= substr($chunk, $offset, $quote - $offset) . ' ';
+                $inLiteral = true;
+                $escapeNext = false;
+                $offset = $quote + 1;
+                continue;
+            }
+
+            if ($escapeNext) {
+                $masked .= ' ';
+                $escapeNext = false;
+                $offset++;
+                continue;
+            }
+
+            $span = strcspn($chunk, "\\'", $offset);
+            if ($span > 0) {
+                $masked .= str_repeat(' ', $span);
+                $offset += $span;
+                if ($offset >= $length) {
+                    break;
+                }
+            }
+
+            if ($chunk[$offset] === '\\') {
+                $masked .= ' ';
+                $offset++;
+                if ($offset < $length) {
+                    $masked .= ' ';
+                    $offset++;
+                } else {
+                    $escapeNext = true;
+                }
+                continue;
+            }
+
+            $masked .= ' ';
+            if ($offset + 1 < $length && $chunk[$offset + 1] === "'") {
+                $masked .= ' ';
+                $offset += 2;
+                continue;
+            }
+            if ($offset + 1 === $length) {
+                $pendingQuote = true;
+                $offset++;
+                break;
+            }
+
+            $inLiteral = false;
+            $offset++;
+        }
+
+        return $masked;
+    }
+
+    private function startsWith(string $value, string $prefix): bool
+    {
+        return strncmp($value, $prefix, strlen($prefix)) === 0;
     }
 
     /** @param resource $output */
