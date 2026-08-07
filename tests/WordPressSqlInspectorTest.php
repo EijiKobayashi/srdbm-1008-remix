@@ -54,6 +54,18 @@ try {
     assert(in_array('wp-content/uploads', $imageValues, true));
     assert(in_array('https://old.example/wp-content/uploads', $imageValues, true));
 
+    $deltaSql = "START TRANSACTION;\n"
+        . "UPDATE `wp_sembawp_posts` SET `post_title`='更新' WHERE `ID`=1;\n"
+        . "DELETE FROM `wp_sembawp_postmeta` WHERE `post_id`=1 AND `meta_key`='_edit_lock';\n"
+        . "INSERT IGNORE INTO `wp_sembawp_term_relationships` (`object_id`,`term_taxonomy_id`,`term_order`) VALUES (1,2,0);\n"
+        . "COMMIT;\n";
+    file_put_contents($input, $deltaSql);
+    $deltaInspection = (new WordPressSqlInspector())->inspect($input);
+    assert($deltaInspection['table_prefixes'][0]['value'] === 'wp_sembawp_');
+    assert($deltaInspection['table_prefixes'][0]['tables'] === 3);
+
+    file_put_contents($input, $sql);
+
     $newPlugins = serialize(['akismet/akismet.php', 'hello-dolly/hello.php']);
     $report = (new SqlDumpReplacer())->process(
         $input,

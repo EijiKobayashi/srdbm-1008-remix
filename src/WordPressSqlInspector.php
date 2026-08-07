@@ -34,6 +34,11 @@ final class WordPressSqlInspector
 
         try {
             foreach ($this->statements($input) as $statement) {
+                $table = $this->dmlTargetTable($statement);
+                if ($table !== null) {
+                    $this->collectTablePrefix($table, $tablePrefixes);
+                }
+
                 $insert = $this->parseInsert($statement);
                 if ($insert === null) {
                     continue;
@@ -43,10 +48,6 @@ final class WordPressSqlInspector
                     continue;
                 }
                 $type = strtolower($match[1]);
-                $prefix = substr($table, 0, -strlen($match[1]));
-                if ($prefix !== '') {
-                    $tablePrefixes[$prefix][$table] = true;
-                }
                 foreach ($rows as $row) {
                     foreach ($row as $value) {
                         if (is_string($value)) {
@@ -175,7 +176,7 @@ final class WordPressSqlInspector
     {
         $buffer = '';
         while (($line = fgets($input)) !== false) {
-            if ($buffer === '' && preg_match('/^\s*INSERT\s+INTO\s+/i', $line) !== 1) {
+            if ($buffer === '' && preg_match('/^\s*(?:INSERT(?:\s+IGNORE)?\s+INTO|REPLACE\s+INTO|UPDATE|DELETE\s+FROM)\s+/i', $line) !== 1) {
                 continue;
             }
             $buffer .= $line;
@@ -192,7 +193,7 @@ final class WordPressSqlInspector
     /** @return array{string,list<string>,Generator<int,list<string|null>>}|null */
     private function parseInsert(string $statement): ?array
     {
-        if (preg_match('/^\s*INSERT\s+INTO\s+`?([^`\s(]+)`?\s*(?:\((.*?)\))?\s+VALUES\s*(.*);\s*$/is', $statement, $match) !== 1) {
+        if (preg_match('/^\s*(?:INSERT(?:\s+IGNORE)?|REPLACE)\s+INTO\s+`?([^`\s(]+)`?\s*(?:\((.*?)\))?\s+VALUES\s*(.*);\s*$/is', $statement, $match) !== 1) {
             return null;
         }
         $columns = [];
@@ -202,6 +203,39 @@ final class WordPressSqlInspector
             }
         }
         return [$match[1], $columns, $this->rows($match[3])];
+    }
+
+    private function dmlTargetTable(string $statement): ?string
+    {
+        if (preg_match(
+            '/^\s*(?:INSERT(?:\s+IGNORE)?\s+INTO|REPLACE\s+INTO|UPDATE|DELETE\s+FROM)\s+(?:(?:`[^`]+`|[^\s.`]+)\.)?`?([^`\s(]+)`?/i',
+            $statement,
+            $match
+        ) !== 1) {
+            return null;
+        }
+
+        return $match[1];
+    }
+
+    /** @param array<string,array<string,bool>> $tablePrefixes */
+    private function collectTablePrefix(string $table, array &$tablePrefixes): void
+    {
+        $coreSuffixes = [
+            'term_relationships', 'term_taxonomy', 'commentmeta', 'postmeta',
+            'usermeta', 'comments', 'options', 'sitemeta', 'posts', 'terms', 'users',
+        ];
+
+        foreach ($coreSuffixes as $suffix) {
+            if (!$this->endsWith(strtolower($table), $suffix)) {
+                continue;
+            }
+            $prefix = substr($table, 0, -strlen($suffix));
+            if ($prefix !== '') {
+                $tablePrefixes[$prefix][$table] = true;
+            }
+            return;
+        }
     }
 
     /** @return Generator<int, list<string|null>> */
