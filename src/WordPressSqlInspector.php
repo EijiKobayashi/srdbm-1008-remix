@@ -13,11 +13,13 @@ final class WordPressSqlInspector
      * @return array{
      *   table_prefixes:list<array{value:string,tables:int}>,
      *   admin_emails:list<array{value:string,labels:list<string>}>,
+     *   emails:list<array{value:string,occurrences:int,tables:list<string>,labels:list<string>}>,
+     *   domain_tables:list<array{table:string,total:int,url:int,host:int,email:int}>,
      *   image_paths:list<array{value:string,occurrences:int}>,
      *   plugin_groups:list<array{id:string,label:string,original:string,associative:bool,plugins:list<array{path:string,active:bool,value:mixed}>}>
      * }
      */
-    public function inspect(string $inputPath): array
+    public function inspect(string $inputPath, string $domainSource = '', string $domainTarget = ''): array
     {
         $input = fopen($inputPath, 'rb');
         if ($input === false) {
@@ -28,9 +30,15 @@ final class WordPressSqlInspector
         $administratorIds = [];
         $tablePrefixes = [];
         $emailLabels = [];
+        $emails = [];
+        $domainTables = [];
         $imagePaths = [];
         $pluginCandidates = [];
         $pluginGroups = [];
+        $domainNormalizer = $domainSource !== '' && $domainTarget !== ''
+            ? new DomainNormalizer($domainSource, $domainTarget)
+            : null;
+        $emailDomain = $domainSource !== '' ? strtolower((string) parse_url($domainSource, PHP_URL_HOST)) : '';
 
         try {
             foreach ($this->statements($input) as $statement) {
@@ -44,15 +52,29 @@ final class WordPressSqlInspector
                     continue;
                 }
                 [$table, $columns, $rows] = $insert;
-                if (preg_match('/(users|usermeta|options|sitemeta)$/i', $table, $match) !== 1) {
-                    continue;
-                }
-                $type = strtolower($match[1]);
+                $type = preg_match('/(users|usermeta|options|sitemeta)$/i', $table, $match) === 1
+                    ? strtolower($match[1])
+                    : '';
                 foreach ($rows as $row) {
                     foreach ($row as $value) {
                         if (is_string($value)) {
                             $this->collectImagePaths($value, $imagePaths);
+                            $this->collectEmails($value, $table, $emailDomain, $emails);
+                            if ($domainNormalizer !== null) {
+                                $result = $domainNormalizer->transform($value);
+                                if ($result['replacements'] > 0) {
+                                    $domainTables[$table] = $domainTables[$table] ?? ['total' => 0, 'url' => 0, 'host' => 0, 'email' => 0];
+                                    $domainTables[$table]['total'] += $result['replacements'];
+                                    foreach ($result['kinds'] as $kind => $count) {
+                                        $domainTables[$table][$kind] += $count;
+                                    }
+                                }
+                            }
                         }
+                    }
+
+                    if ($type === '') {
+                        continue;
                     }
 
                     if ($type === 'users') {
@@ -133,7 +155,16 @@ final class WordPressSqlInspector
             $emailLabels[$user['email']]['管理者ユーザー: ' . $user['login']] = true;
         }
 
+        foreach ($emailLabels as $email => $labels) {
+            $emailKey = strtolower($email);
+            if (isset($emails[$emailKey])) {
+                $emails[$emailKey]['labels'] = $labels;
+            }
+        }
+
         ksort($emailLabels, SORT_NATURAL | SORT_FLAG_CASE);
+        ksort($emails, SORT_NATURAL | SORT_FLAG_CASE);
+        ksort($domainTables, SORT_NATURAL | SORT_FLAG_CASE);
         ksort($imagePaths, SORT_NATURAL | SORT_FLAG_CASE);
         ksort($pluginCandidates, SORT_NATURAL | SORT_FLAG_CASE);
         uksort($tablePrefixes, static function (string $left, string $right) use ($tablePrefixes): int {
@@ -164,6 +195,19 @@ final class WordPressSqlInspector
             'admin_emails' => array_map(static function (string $email, array $labels): array {
                 return ['value' => $email, 'labels' => array_keys($labels)];
             }, array_keys($emailLabels), array_values($emailLabels)),
+            'emails' => array_map(static function (string $email, array $details): array {
+                $tables = array_keys($details['tables'] ?? []);
+                sort($tables, SORT_NATURAL | SORT_FLAG_CASE);
+                return [
+                    'value' => $email,
+                    'occurrences' => (int) ($details['occurrences'] ?? 0),
+                    'tables' => $tables,
+                    'labels' => array_keys($details['labels'] ?? []),
+                ];
+            }, array_keys($emails), array_values($emails)),
+            'domain_tables' => array_map(static function (string $table, array $counts): array {
+                return ['table' => $table] + $counts;
+            }, array_keys($domainTables), array_values($domainTables)),
             'image_paths' => array_map(static function (string $path, int $occurrences): array {
                 return ['value' => $path, 'occurrences' => $occurrences];
             }, array_keys($imagePaths), array_values($imagePaths)),
@@ -349,6 +393,26 @@ final class WordPressSqlInspector
             foreach ($matches[0] as $path) {
                 $paths[$path] = ($paths[$path] ?? 0) + 1;
             }
+        }
+    }
+
+    /** @param array<string,array{occurrences:int,tables:array<string,bool>,labels?:array<string,bool>}> $emails */
+    private function collectEmails(string $value, string $table, string $emailDomain, array &$emails): void
+    {
+        if ($emailDomain === '') {
+            return;
+        }
+        if (preg_match_all('/(?<![A-Z0-9_+.-])[A-Z0-9_+-]+(?:\.[A-Z0-9_+-]+)*@(?:[A-Z0-9](?:[A-Z0-9-]*[A-Z0-9])?\.)+[A-Z]{2,}(?![A-Z0-9.-])/i', $value, $matches) < 1) {
+            return;
+        }
+        foreach ($matches[0] as $email) {
+            $normalized = strtolower($email);
+            if (substr($normalized, strrpos($normalized, '@') + 1) !== $emailDomain) {
+                continue;
+            }
+            $emails[$normalized] = $emails[$normalized] ?? ['occurrences' => 0, 'tables' => []];
+            $emails[$normalized]['occurrences']++;
+            $emails[$normalized]['tables'][$table] = true;
         }
     }
 
