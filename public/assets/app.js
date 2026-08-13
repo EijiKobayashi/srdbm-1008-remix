@@ -16,6 +16,16 @@ const inspectionEmpty = document.querySelector('#inspection-empty');
 const inspectionLoading = document.querySelector('#inspection-loading');
 const inspectionResults = document.querySelector('#inspection-results');
 const dryRunButton = form?.querySelector('button[value="dry-run"]');
+const dryRunStateNode = document.querySelector('#dry-run-wordpress-state');
+
+let dryRunState = null;
+if (dryRunStateNode) {
+    try {
+        dryRunState = JSON.parse(dryRunStateNode.textContent || 'null');
+    } catch (error) {
+        dryRunState = null;
+    }
+}
 
 let inspectionRequest = 0;
 
@@ -50,6 +60,15 @@ const settingBlock = (title, description, count) => {
 const renderInspection = (inspection) => {
     inspectionResults.replaceChildren();
 
+    if (dryRunState) {
+        const notice = element('div', 'border-l-4 border-wp-blue bg-[#f0f6fc] p-4');
+        notice.append(
+            element('p', 'font-semibold text-wp-ink', 'ドライラン適用内容（変更予定）'),
+            element('p', 'mt-1 text-xs leading-5 text-wp-muted', '以下はドライランで使用した設定です。「変換する」では同じ内容を適用します。変更する場合は「最初から」やり直してください。')
+        );
+        inspectionResults.append(notice);
+    }
+
     const prefixes = Array.isArray(inspection.table_prefixes) ? inspection.table_prefixes : [];
     const prefixBlock = settingBlock('テーブル接頭辞', 'SQLから検出した正確な接頭辞です。変更する場合は、この値を「変更前」に設定してください。', prefixes.length);
     const prefixList = element('div', 'space-y-2');
@@ -74,6 +93,7 @@ const renderInspection = (inspection) => {
     prefixBlock.append(prefixList);
 
     const domainTables = Array.isArray(inspection.domain_tables) ? inspection.domain_tables : [];
+    const selectedDomainTables = new Set(Array.isArray(dryRunState?.domain_tables) ? dryRunState.domain_tables : []);
     const domainMapping = inspection.domain_mapping || {};
     const domainBlock = settingBlock('ドメイン置換対象テーブル', 'チェックを外したテーブルでは、URL・ホスト名・メールアドレスのドメインを置換しません。', domainTables.length);
     const domainPresent = document.createElement('input');
@@ -96,7 +116,7 @@ const renderInspection = (inspection) => {
         checkbox.type = 'checkbox';
         checkbox.name = 'domain_tables[]';
         checkbox.value = item.table;
-        checkbox.checked = true;
+        checkbox.checked = dryRunState ? selectedDomainTables.has(item.table) : true;
         checkbox.className = 'mt-0.5';
         const details = element('span', 'min-w-0 flex-1');
         details.append(element('code', 'block break-all text-sm font-semibold', item.table));
@@ -126,7 +146,7 @@ const renderInspection = (inspection) => {
         const replacement = document.createElement('input');
         replacement.type = 'email';
         replacement.name = 'email_replacement[]';
-        replacement.value = item.value;
+        replacement.value = dryRunState?.email_replacements?.[item.value] || item.value;
         replacement.setAttribute('aria-label', `${item.value} の変更後メールアドレス`);
         row.append(hidden, originalWrap, element('span', 'hidden text-wp-muted sm:block', '→'), replacement);
         return row;
@@ -170,7 +190,7 @@ const renderInspection = (inspection) => {
         const replacement = document.createElement('input');
         replacement.type = 'text';
         replacement.name = 'image_path_replacement[]';
-        replacement.value = item.value;
+        replacement.value = dryRunState?.image_path_replacements?.[item.value] || item.value;
         replacement.setAttribute('aria-label', `${item.value} の変更後画像パス`);
         row.append(hidden, originalWrap, element('span', 'hidden text-wp-muted sm:block', '→'), replacement);
         pathList.append(row);
@@ -184,6 +204,7 @@ const renderInspection = (inspection) => {
         pluginBlock.append(element('p', 'text-sm text-wp-muted', 'プラグイン設定は検出されませんでした。'));
     }
     groups.forEach((group) => {
+        const selectedPlugins = new Set(Array.isArray(dryRunState?.plugins?.[group.id]) ? dryRunState.plugins[group.id] : []);
         const groupWrap = element('fieldset', 'mb-4 rounded-sm border border-wp-line p-4 last:mb-0');
         groupWrap.append(element('legend', 'px-1 text-sm font-semibold', group.label));
         const present = document.createElement('input');
@@ -198,7 +219,7 @@ const renderInspection = (inspection) => {
             checkbox.type = 'checkbox';
             checkbox.name = `plugins[${group.id}][]`;
             checkbox.value = plugin.path;
-            checkbox.checked = Boolean(plugin.active);
+            checkbox.checked = dryRunState ? selectedPlugins.has(plugin.path) : Boolean(plugin.active);
             checkbox.className = 'mt-0.5';
             label.append(checkbox, element('span', 'break-all text-sm', plugin.path));
             list.append(label);
@@ -212,6 +233,12 @@ const renderInspection = (inspection) => {
     inspectionLoading.classList.add('hidden');
     inspectionLoading.classList.remove('flex');
     inspectionResults.classList.remove('hidden');
+    if (dryRunState) {
+        inspectionResults.querySelectorAll('input, button').forEach((control) => {
+            control.disabled = true;
+        });
+        if (dryRunButton) dryRunButton.disabled = true;
+    }
 };
 
 const inspectSql = async (filename) => {
@@ -244,7 +271,7 @@ const inspectSql = async (filename) => {
         inspectionEmpty.textContent = error instanceof Error ? error.message : 'SQLの解析に失敗しました。';
         inspectionEmpty.className = 'border border-wp-danger bg-[#fcf0f1] p-5 text-sm text-wp-danger';
     } finally {
-        if (requestId === inspectionRequest && dryRunButton) dryRunButton.disabled = false;
+        if (requestId === inspectionRequest && dryRunButton) dryRunButton.disabled = Boolean(dryRunState);
     }
 };
 
