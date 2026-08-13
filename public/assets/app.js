@@ -57,6 +57,35 @@ const settingBlock = (title, description, count) => {
     return block;
 };
 
+const hostnameFromUrl = (value) => {
+    try {
+        return new URL(value).hostname;
+    } catch (error) {
+        return '';
+    }
+};
+
+const emailWithDomain = (email, domain) => {
+    const separator = email.lastIndexOf('@');
+    return separator > 0 && domain ? `${email.slice(0, separator)}@${domain}` : email;
+};
+
+const domainFromEmail = (email) => {
+    const separator = email.lastIndexOf('@');
+    return separator > 0 ? email.slice(separator + 1) : '';
+};
+
+const normalizedEmailDomain = (value) => {
+    const candidate = value.trim().replace(/^@/, '');
+    if (!candidate || /[\s\/:]/.test(candidate)) return '';
+    try {
+        const parsed = new URL(`https://${candidate}`);
+        return parsed.hostname && parsed.hostname === parsed.host ? parsed.hostname : '';
+    } catch (error) {
+        return '';
+    }
+};
+
 const renderInspection = (inspection) => {
     inspectionResults.replaceChildren();
 
@@ -164,12 +193,56 @@ const renderInspection = (inspection) => {
     const adminEmailValues = new Set(adminEmails.map((item) => item.value));
     const domainEmails = (Array.isArray(inspection.domain_emails) ? inspection.domain_emails : [])
         .filter((item) => !adminEmailValues.has(item.value));
-    const domainEmailBlock = settingBlock('置換元ドメインのその他メール', '「@置換元ドメイン」に完全一致するメールを表示します。管理者メールとの重複は上の項目へまとめています。', domainEmails.length);
+    const domainEmailBlock = settingBlock('置換元ドメインのその他メール', '「@置換元ドメイン」に完全一致するメールを表示します。個別変更またはドメインの一括変換ができます。管理者メールとの重複は上の項目へまとめています。', domainEmails.length);
     const domainEmailList = element('div', 'space-y-3');
     if (domainEmails.length === 0) {
         domainEmailList.append(element('p', 'text-sm text-wp-muted', '管理者メール以外の対象メールは検出されませんでした。'));
     }
     domainEmails.forEach((item) => domainEmailList.append(emailRow(item)));
+    const sourceEmailDomain = hostnameFromUrl(domainMapping.source || '');
+    const targetEmailDomain = hostnameFromUrl(domainMapping.target || '');
+    if (domainEmails.length > 0 && sourceEmailDomain && targetEmailDomain) {
+        const bulkWrap = element('div', 'mb-4 rounded-sm border border-wp-line bg-[#fafafa] p-3');
+        bulkWrap.append(element('p', 'mb-3 text-sm font-semibold text-wp-ink', 'メールドメインを一括変換'));
+        const bulkContent = element('div', 'grid gap-2 sm:grid-cols-[minmax(0,1fr)_auto_minmax(0,1fr)_auto] sm:items-center');
+        const sourceDomainLabel = element('code', 'break-all rounded-sm bg-white px-3 py-2.5 text-sm', `@${sourceEmailDomain}`);
+        const bulkDomainInput = document.createElement('input');
+        bulkDomainInput.type = 'text';
+        bulkDomainInput.placeholder = targetEmailDomain;
+        bulkDomainInput.setAttribute('aria-label', '一括変換後のメールドメイン');
+        bulkDomainInput.autocomplete = 'off';
+        const dryRunDomains = new Set(domainEmails.map((item) => {
+            const replacement = dryRunState?.email_replacements?.[item.value] || item.value;
+            return domainFromEmail(replacement);
+        }).filter(Boolean));
+        bulkDomainInput.value = dryRunState && dryRunDomains.size === 1
+            ? Array.from(dryRunDomains)[0]
+            : targetEmailDomain;
+        const bulkButton = element('button', 'btn secondary shrink-0', '一括変換を入力欄へ反映');
+        bulkButton.type = 'button';
+        const bulkStatus = element('p', 'mt-2 hidden text-xs font-medium text-wp-success');
+        bulkStatus.setAttribute('role', 'status');
+        bulkButton.addEventListener('click', () => {
+            const replacementDomain = normalizedEmailDomain(bulkDomainInput.value);
+            if (!replacementDomain) {
+                bulkStatus.textContent = '変換後のドメインを正しく入力してください。例: example.com';
+                bulkStatus.classList.remove('hidden', 'text-wp-success');
+                bulkStatus.classList.add('text-wp-danger');
+                bulkDomainInput.focus();
+                return;
+            }
+            bulkDomainInput.value = replacementDomain;
+            domainEmailList.querySelectorAll('input[name="email_replacement[]"]').forEach((input) => {
+                input.value = emailWithDomain(input.value, replacementDomain);
+            });
+            bulkStatus.textContent = `${domainEmails.length.toLocaleString()}件の入力欄へ反映しました。必要に応じて個別に変更できます。`;
+            bulkStatus.classList.remove('hidden', 'text-wp-danger');
+            bulkStatus.classList.add('text-wp-success');
+        });
+        bulkContent.append(sourceDomainLabel, element('span', 'hidden text-center text-wp-muted sm:block', '→'), bulkDomainInput, bulkButton);
+        bulkWrap.append(bulkContent, element('p', 'mt-2 text-xs text-wp-muted', '@より前は維持されます。変換後ドメインは任意に入力できます。'), bulkStatus);
+        domainEmailBlock.append(bulkWrap);
+    }
     domainEmailBlock.append(domainEmailList);
 
     const paths = Array.isArray(inspection.image_paths) ? inspection.image_paths : [];
