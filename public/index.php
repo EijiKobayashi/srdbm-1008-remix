@@ -109,6 +109,13 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     validateDetectedTablePrefix($inspection, $sourcePrefix, $errors);
                     [$emailReplacements, $imagePathReplacements, $pluginOverrides, $domainTables] = requestedWordPressChanges($inspection, $errors);
                     if ($errors === []) {
+                        $wordpressState = buildWordPressUiState(
+                            $inspection,
+                            $emailReplacements,
+                            $imagePathReplacements,
+                            $pluginOverrides,
+                            $domainTables
+                        );
                         $result = runDryRunAndBackup(
                             $inputPath,
                             $sourceUrl,
@@ -118,7 +125,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                             $emailReplacements,
                             $imagePathReplacements,
                             $pluginOverrides,
-                            $domainTables
+                            $domainTables,
+                            $wordpressState
                         );
                     }
                 } catch (Throwable $error) {
@@ -417,6 +425,56 @@ function requestedWordPressChanges(array $inspection, array &$errors): array
     return [$emailReplacements, $imagePathReplacements, $pluginOverrides, $domainTables];
 }
 
+/**
+ * @param array<string,mixed> $inspection
+ * @param array<string,string> $emailReplacements
+ * @param array<string,string> $imagePathReplacements
+ * @param array<string,string> $pluginOverrides
+ * @param list<string> $domainTables
+ * @return array{domain_tables:list<string>,email_replacements:array<string,string>,image_path_replacements:array<string,string>,plugins:array<string,list<string>>}
+ */
+function buildWordPressUiState(
+    array $inspection,
+    array $emailReplacements,
+    array $imagePathReplacements,
+    array $pluginOverrides,
+    array $domainTables
+): array
+{
+    $plugins = [];
+    foreach ($inspection['plugin_groups'] ?? [] as $group) {
+        $groupId = (string) ($group['id'] ?? '');
+        if ($groupId === '') {
+            continue;
+        }
+        $selected = [];
+        foreach ($group['plugins'] ?? [] as $plugin) {
+            if ((bool) ($plugin['active'] ?? false)) {
+                $selected[] = (string) ($plugin['path'] ?? '');
+            }
+        }
+        $original = (string) ($group['original'] ?? '');
+        if (isset($pluginOverrides[$original])) {
+            $decoded = @unserialize($pluginOverrides[$original], ['allowed_classes' => false]);
+            if (is_array($decoded)) {
+                $selected = (bool) ($group['associative'] ?? false)
+                    ? array_map('strval', array_keys($decoded))
+                    : array_values(array_filter($decoded, 'is_string'));
+            }
+        }
+        $plugins[$groupId] = array_values(array_filter($selected, static function (string $path): bool {
+            return $path !== '';
+        }));
+    }
+
+    return [
+        'domain_tables' => array_values($domainTables),
+        'email_replacements' => $emailReplacements,
+        'image_path_replacements' => $imagePathReplacements,
+        'plugins' => $plugins,
+    ];
+}
+
 /** @param list<string> $errors */
 function resolveChunkedSql(string $name, array &$errors): string
 {
@@ -479,7 +537,8 @@ function resolveSelectedSql(string $name, array &$errors): string
  * @param array<string,string> $imagePathReplacements
  * @param array<string,string> $pluginOverrides
  * @param list<string> $domainTables
- * @return array{changes:int,url_changes:int,prefix_changes:int,email_changes:int,image_changes:int,plugin_changes:int,bytes:int,elapsed:float,dry_run:bool,output:string,backup:string,job_token:string}
+ * @param array<string,mixed> $wordpressState
+ * @return array{changes:int,url_changes:int,prefix_changes:int,email_changes:int,image_changes:int,plugin_changes:int,bytes:int,elapsed:float,dry_run:bool,output:string,backup:string,job_token:string,wordpress_state:array<string,mixed>}
  */
 function runDryRunAndBackup(
     string $input,
@@ -490,7 +549,8 @@ function runDryRunAndBackup(
     array $emailReplacements,
     array $imagePathReplacements,
     array $pluginOverrides,
-    array $domainTables
+    array $domainTables,
+    array $wordpressState
 ): array
 {
     $base = safeName(pathinfo($input, PATHINFO_FILENAME));
@@ -529,8 +589,15 @@ function runDryRunAndBackup(
             'prefix_search' => $prefixSearch, 'prefix_replace' => $prefixReplace,
             'email_replacements' => $emailReplacements, 'image_path_replacements' => $imagePathReplacements,
             'plugin_overrides' => $pluginOverrides, 'domain_tables' => $domainTables,
+            'wordpress_state' => $wordpressState,
         ]];
-        return $report + ['dry_run' => true, 'output' => '', 'backup' => $backupName, 'job_token' => $jobToken];
+        return $report + [
+            'dry_run' => true,
+            'output' => '',
+            'backup' => $backupName,
+            'job_token' => $jobToken,
+            'wordpress_state' => $wordpressState,
+        ];
     } catch (Throwable $error) {
         @unlink($working);
         @unlink($backup);
@@ -627,7 +694,7 @@ function iniBytes(string $value): int { $number = (float) $value; $unit = strtol
 <body class="min-h-screen text-[14px]">
 <div id="loading" class="fixed inset-0 z-50 hidden items-center justify-center bg-white/80 backdrop-blur-sm"><div class="text-center"><div class="mx-auto mb-4 h-8 w-8 animate-spin rounded-full border-2 border-wp-line border-t-wp-blue"></div><p class="font-semibold">SQLを処理しています</p><p class="mt-1 text-xs text-wp-muted">画面を閉じずにお待ちください。</p></div></div>
 <header class="fixed inset-x-0 top-0 z-40 flex h-12 items-center bg-wp-ink text-white"><div class="flex h-12 w-60 items-center gap-3 border-r border-white/10 px-4"><span class="grid h-7 w-7 place-items-center rounded-full border border-white/70 font-bold">S</span><span class="font-semibold">SRDBM 1008</span></div><p class="hidden px-4 text-xs text-white/60 sm:block">SQL File Migration Workspace</p><a class="ml-auto flex h-12 items-center gap-2 border-l border-white/10 px-4 text-sm font-medium hover:bg-white/10 sm:px-5" href="<?= e($cookiePath) ?>" title="入力内容を破棄して初期画面へ戻る"><span aria-hidden="true">↶</span>最初から</a></header>
-<aside class="fixed bottom-0 left-0 top-12 hidden w-60 bg-[#23282d] text-[#c3c4c7] lg:block"><nav class="py-3"><a class="flex h-11 items-center gap-3 border-l-4 border-[#72aee6] bg-white/10 px-4 text-white" href="#replace"><span>↔</span><span class="font-medium">SQL置換</span></a><a class="flex h-11 items-center gap-3 px-5 hover:bg-white/5" href="#files"><span>▤</span><span>SQLファイル</span></a><a class="flex h-11 items-center gap-3 px-5 hover:bg-white/5" href="#outputs"><span>⇩</span><span>変換済みSQL</span></a></nav><div class="absolute bottom-0 p-4 text-xs leading-5 text-white/50">DB接続なし<br>SRDBM 1008 REMIX v0.0.5</div></aside>
+<aside class="fixed bottom-0 left-0 top-12 hidden w-60 bg-[#23282d] text-[#c3c4c7] lg:block"><nav class="py-3"><a class="flex h-11 items-center gap-3 border-l-4 border-[#72aee6] bg-white/10 px-4 text-white" href="#replace"><span>↔</span><span class="font-medium">SQL置換</span></a><a class="flex h-11 items-center gap-3 px-5 hover:bg-white/5" href="#files"><span>▤</span><span>SQLファイル</span></a><a class="flex h-11 items-center gap-3 px-5 hover:bg-white/5" href="#outputs"><span>⇩</span><span>変換済みSQL</span></a></nav><div class="absolute bottom-0 p-4 text-xs leading-5 text-white/50">DB接続なし<br>SRDBM 1008 REMIX v0.0.6</div></aside>
 <main class="pt-12 lg:pl-60"><div class="mx-auto max-w-[1180px] px-4 py-8 sm:px-8">
 <div class="mb-7"><p class="mb-2 text-xs text-wp-muted">ツール › SQLファイル変換</p><h1 class="text-[28px] font-semibold tracking-tight">SQLを安全に置換</h1><p class="mt-2 leading-6 text-wp-muted">データベースへ接続せず、SQLダンプを直接変換します。元SQLは保持され、シリアライズデータの文字数も自動調整されます。</p></div>
 <?php if ($errors !== []): ?><div class="mb-6 border-l-4 border-wp-danger bg-white p-4" role="alert"><p class="font-semibold text-wp-danger">確認が必要です</p><ul class="mt-2 list-disc space-y-1 pl-5"><?php foreach ($errors as $error): ?><li><?= e($error) ?></li><?php endforeach; ?></ul></div><?php endif; ?>
@@ -640,6 +707,10 @@ function iniBytes(string $value): int { $number = (float) $value; $unit = strtol
 <div class="sticky bottom-0 z-20 flex flex-col-reverse justify-between gap-3 border border-wp-line bg-white/95 p-4 shadow-lg sm:flex-row sm:items-center"><p class="text-xs text-wp-muted">ドライラン時に元SQLをバックアップします。</p><button class="btn primary" type="submit" name="action" value="dry-run">ドライランしてバックアップ</button></div>
 </div>
 <aside class="space-y-6 xl:sticky xl:top-20"><section class="panel p-5"><h2 class="font-semibold">処理フロー</h2><ol class="mt-4 space-y-3 text-sm"><li><strong class="mr-2 text-wp-blue">1</strong>SQLをアップロード</li><li><strong class="mr-2 text-wp-blue">2</strong>置換条件を指定</li><li><strong class="mr-2 text-wp-blue">3</strong>WordPress設定を確認 <span class="text-xs text-wp-muted">任意</span></li><li><strong class="mr-2 text-wp-blue">4</strong>ドライラン・バックアップ</li><li><strong class="mr-2 text-wp-blue">5</strong>変更件数を確認</li><li><strong class="mr-2 text-wp-blue">6</strong>変換する</li></ol></section><section class="panel p-5"><div class="mb-4 flex justify-between"><h2 class="font-semibold">実行環境</h2><span class="text-xs font-semibold <?= $readyCount === count($preflight) ? 'text-wp-success' : 'text-[#996800]' ?>"><?= $readyCount ?>/<?= count($preflight) ?> READY</span></div><ul class="space-y-3"><?php foreach ($preflight as $item): ?><li class="flex justify-between"><span><?= e($item['label']) ?></span><span class="grid h-5 w-5 place-items-center rounded-full text-xs <?= $item['ready'] ? 'bg-[#edfaef] text-wp-success' : 'bg-[#fcf0f1] text-wp-danger' ?>"><?= $item['ready'] ? '✓' : '!' ?></span></li><?php endforeach; ?></ul></section><section id="outputs" class="panel p-5"><h2 class="font-semibold">最近の変換済みSQL</h2><?php if ($outputFiles === []): ?><p class="mt-3 text-xs text-wp-muted">まだ出力はありません。</p><?php else: ?><ul class="mt-3 divide-y divide-wp-line"><?php foreach ($outputFiles as $file): ?><li class="py-3"><a class="block truncate text-sm font-medium text-wp-blue" href="?download=<?= rawurlencode(basename($file)) ?>"><?= e(basename($file)) ?></a><span class="text-xs text-wp-muted"><?= e(fileSizeLabel($file)) ?></span></li><?php endforeach; ?></ul><?php endif; ?></section><div class="border border-[#c5d9ed] bg-[#f0f6fc] p-4 text-xs leading-5"><strong class="block">DB接続は不要です</strong>SQLファイルだけを読み書きし、データベースには接続しません。</div></aside>
-</form><footer class="mt-8 border-t border-wp-line py-5 text-center text-xs text-wp-muted">&copy; Oshinco Co-op.</footer></div></main><script src="assets/app.js?v=<?= (int) filemtime(__DIR__ . '/assets/app.js') ?>"></script></body></html>
+</form><footer class="mt-8 border-t border-wp-line py-5 text-center text-xs text-wp-muted">&copy; Oshinco Co-op.</footer></div></main>
+<?php if ($result !== null && $result['dry_run'] && isset($result['wordpress_state'])): ?>
+<script id="dry-run-wordpress-state" type="application/json"><?= json_encode($result['wordpress_state'], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT) ?></script>
+<?php endif; ?>
+<script src="assets/app.js?v=<?= (int) filemtime(__DIR__ . '/assets/app.js') ?>"></script></body></html>
 <?php
 function fileSizeLabelFromBytes(int $bytes): string { return $bytes >= 1048576 ? number_format($bytes / 1048576, 1) . ' MB' : number_format($bytes / 1024, 1) . ' KB'; }
