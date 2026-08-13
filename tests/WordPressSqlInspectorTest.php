@@ -21,6 +21,7 @@ $capabilities = serialize(['administrator' => true]);
 $activePlugins = serialize(['akismet/akismet.php']);
 $recentlyActivated = serialize(['hello-dolly/hello.php' => 1710000000]);
 $nestedEmail = serialize(['notification' => 'admin@example.com']);
+$escapedStagingUrl = 'https:\/\/semba-stg.bizproject.biz/api';
 $sql = "INSERT INTO `wp_sembawpusers` VALUES\n"
     . "(1,'admin','hash','admin','admin@example.com','','','2026-01-01 00:00:00','',0,'Admin'),\n"
     . "(2,'editor','hash','editor','editor@example.com','','','2026-01-01 00:00:00','',0,'Editor');\n"
@@ -31,17 +32,36 @@ $sql = "INSERT INTO `wp_sembawpusers` VALUES\n"
     . "(3,'asset_url','https://old.example/wp-content/uploads/2026/image.jpg','yes'),\n"
     . "(4,'active_plugins','" . $escape($activePlugins) . "','yes'),\n"
     . "(5,'recently_activated','" . $escape($recentlyActivated) . "','yes'),\n"
-    . "(6,'mail_settings','" . $escape($nestedEmail) . "','yes');\n";
+    . "(6,'mail_settings','" . $escape($nestedEmail) . "','yes'),\n"
+    . "(7,'staging_email','notify@semba-stg.bizproject.biz','yes'),\n"
+    . "(8,'staging_url','" . $escape($escapedStagingUrl) . "','yes'),\n"
+    . "(9,'not_email','@semba-stg.bizproject.biz','yes'),\n"
+    . "(10,'bad_email','bad..name@semba-stg.bizproject.biz','yes');\n"
+    . "INSERT INTO `wp_logs` VALUES (1,'https://semba-stg.bizproject.biz/log');\n";
 file_put_contents($input, $sql);
 
 try {
-    $inspection = (new WordPressSqlInspector())->inspect($input);
+    $inspection = (new WordPressSqlInspector())->inspect(
+        $input,
+        'https://semba-stg.bizproject.biz',
+        'https://www.semba1008.co.jp'
+    );
     assert($inspection['table_prefixes'][0]['value'] === 'wp_sembawp');
     assert($inspection['table_prefixes'][0]['tables'] === 3);
     assert(count($inspection['admin_emails']) === 1);
     assert($inspection['admin_emails'][0]['value'] === 'admin@example.com');
     assert(in_array('管理者ユーザー: admin', $inspection['admin_emails'][0]['labels'], true));
     assert(count($inspection['plugin_groups']) === 1);
+    $detectedEmails = array_column($inspection['emails'], null, 'value');
+    assert(isset($detectedEmails['notify@semba-stg.bizproject.biz']));
+    assert(!isset($detectedEmails['admin@example.com']));
+    assert(!isset($detectedEmails['editor@example.com']));
+    assert(!isset($detectedEmails['bad..name@semba-stg.bizproject.biz']));
+    assert(in_array('wp_sembawpoptions', $detectedEmails['notify@semba-stg.bizproject.biz']['tables'], true));
+    $domainTables = array_column($inspection['domain_tables'], null, 'table');
+    assert($domainTables['wp_sembawpoptions']['url'] === 1);
+    assert($domainTables['wp_sembawpoptions']['email'] === 1);
+    assert($domainTables['wp_logs']['url'] === 1);
 
     $plugins = [];
     foreach ($inspection['plugin_groups'][0]['plugins'] as $plugin) {

@@ -7,6 +7,9 @@ const uploadStatus = document.querySelector('#upload-status');
 const dropZone = document.querySelector('#drop-zone');
 const sqlSelect = document.querySelector('#sql_file');
 const chunkedSqlFile = document.querySelector('#chunked_sql_file');
+const sourceUrl = document.querySelector('#source_url');
+const destinationUrl = document.querySelector('#destination_url');
+const forceHttps = document.querySelector('#force_https');
 const sourcePrefix = document.querySelector('#source_prefix');
 const destinationPrefix = document.querySelector('#destination_prefix');
 const inspectionEmpty = document.querySelector('#inspection-empty');
@@ -70,17 +73,52 @@ const renderInspection = (inspection) => {
     });
     prefixBlock.append(prefixList);
 
-    const emails = Array.isArray(inspection.admin_emails) ? inspection.admin_emails : [];
-    const emailBlock = settingBlock('管理者メールアドレス', '変更する場合だけ右側を書き換えてください。同じ値のままなら変更しません。', emails.length);
-    const emailList = element('div', 'space-y-3');
-    if (emails.length === 0) {
-        emailList.append(element('p', 'text-sm text-wp-muted', '管理者メールアドレスは検出されませんでした。'));
+    const domainTables = Array.isArray(inspection.domain_tables) ? inspection.domain_tables : [];
+    const domainMapping = inspection.domain_mapping || {};
+    const domainBlock = settingBlock('ドメイン置換対象テーブル', 'チェックを外したテーブルでは、URL・ホスト名・メールアドレスのドメインを置換しません。', domainTables.length);
+    const domainPresent = document.createElement('input');
+    domainPresent.type = 'hidden';
+    domainPresent.name = 'domain_tables_present';
+    domainPresent.value = '1';
+    const mapping = element('div', 'mb-4 grid gap-2 rounded-sm bg-[#f0f6fc] p-3 sm:grid-cols-[minmax(0,1fr)_auto_minmax(0,1fr)] sm:items-center');
+    mapping.append(
+        element('code', 'break-all text-xs font-semibold', domainMapping.source || ''),
+        element('span', 'hidden text-wp-muted sm:block', '→'),
+        element('code', 'break-all text-xs font-semibold', domainMapping.target || '')
+    );
+    const domainList = element('div', 'space-y-2');
+    if (domainTables.length === 0) {
+        domainList.append(element('p', 'text-sm text-wp-muted', 'ドメイン置換候補は検出されませんでした。'));
     }
-    emails.forEach((item) => {
+    domainTables.forEach((item) => {
+        const label = element('label', 'flex items-start gap-3 rounded-sm bg-[#f6f7f7] p-3');
+        const checkbox = document.createElement('input');
+        checkbox.type = 'checkbox';
+        checkbox.name = 'domain_tables[]';
+        checkbox.value = item.table;
+        checkbox.checked = true;
+        checkbox.className = 'mt-0.5';
+        const details = element('span', 'min-w-0 flex-1');
+        details.append(element('code', 'block break-all text-sm font-semibold', item.table));
+        const counts = [];
+        if (Number(item.url || 0) > 0) counts.push(`URL ${Number(item.url).toLocaleString()}件`);
+        if (Number(item.host || 0) > 0) counts.push(`ホスト ${Number(item.host).toLocaleString()}件`);
+        if (Number(item.email || 0) > 0) counts.push(`メール ${Number(item.email).toLocaleString()}件`);
+        details.append(element('small', 'mt-1 block text-xs text-wp-muted', `${counts.join(' / ')}（計 ${Number(item.total || 0).toLocaleString()}件）`));
+        label.append(checkbox, details);
+        domainList.append(label);
+    });
+    domainBlock.append(domainPresent, mapping, domainList);
+
+    const emailRow = (item) => {
         const row = element('div', 'grid gap-2 rounded-sm bg-[#f6f7f7] p-3 sm:grid-cols-[minmax(0,1fr)_auto_minmax(0,1fr)] sm:items-center');
         const originalWrap = element('div');
         originalWrap.append(element('p', 'break-all text-sm font-medium', item.value));
-        originalWrap.append(element('p', 'mt-1 text-xs text-wp-muted', Array.isArray(item.labels) ? item.labels.join(' / ') : ''));
+        const emailDetails = [];
+        if (Array.isArray(item.labels)) emailDetails.push(...item.labels);
+        if (Number(item.occurrences || 0) > 0) emailDetails.push(`${Number(item.occurrences).toLocaleString()}箇所`);
+        if (Array.isArray(item.tables) && item.tables.length > 0) emailDetails.push(item.tables.join(', '));
+        originalWrap.append(element('p', 'mt-1 break-all text-xs text-wp-muted', emailDetails.join(' / ')));
         const hidden = document.createElement('input');
         hidden.type = 'hidden';
         hidden.name = 'email_original[]';
@@ -91,9 +129,28 @@ const renderInspection = (inspection) => {
         replacement.value = item.value;
         replacement.setAttribute('aria-label', `${item.value} の変更後メールアドレス`);
         row.append(hidden, originalWrap, element('span', 'hidden text-wp-muted sm:block', '→'), replacement);
-        emailList.append(row);
-    });
-    emailBlock.append(emailList);
+        return row;
+    };
+
+    const adminEmails = Array.isArray(inspection.admin_emails) ? inspection.admin_emails : [];
+    const adminEmailBlock = settingBlock('管理者メールアドレス', 'WordPressのサイト管理者設定と管理者ユーザーから検出しました。必要な場合だけ変更してください。', adminEmails.length);
+    const adminEmailList = element('div', 'space-y-3');
+    if (adminEmails.length === 0) {
+        adminEmailList.append(element('p', 'text-sm text-wp-muted', '管理者メールアドレスは検出されませんでした。'));
+    }
+    adminEmails.forEach((item) => adminEmailList.append(emailRow(item)));
+    adminEmailBlock.append(adminEmailList);
+
+    const adminEmailValues = new Set(adminEmails.map((item) => item.value));
+    const domainEmails = (Array.isArray(inspection.domain_emails) ? inspection.domain_emails : [])
+        .filter((item) => !adminEmailValues.has(item.value));
+    const domainEmailBlock = settingBlock('置換元ドメインのその他メール', '「@置換元ドメイン」に完全一致するメールを表示します。管理者メールとの重複は上の項目へまとめています。', domainEmails.length);
+    const domainEmailList = element('div', 'space-y-3');
+    if (domainEmails.length === 0) {
+        domainEmailList.append(element('p', 'text-sm text-wp-muted', '管理者メール以外の対象メールは検出されませんでした。'));
+    }
+    domainEmails.forEach((item) => domainEmailList.append(emailRow(item)));
+    domainEmailBlock.append(domainEmailList);
 
     const paths = Array.isArray(inspection.image_paths) ? inspection.image_paths : [];
     const pathBlock = settingBlock('画像パス', 'SQL内で検出したアップロード基点です。個別画像名ではなく、この基点をまとめて変更します。', paths.length);
@@ -150,7 +207,7 @@ const renderInspection = (inspection) => {
         pluginBlock.append(groupWrap);
     });
 
-    inspectionResults.append(prefixBlock, emailBlock, pathBlock, pluginBlock);
+    inspectionResults.append(prefixBlock, domainBlock, adminEmailBlock, domainEmailBlock, pathBlock, pluginBlock);
     inspectionEmpty.classList.add('hidden');
     inspectionLoading.classList.add('hidden');
     inspectionLoading.classList.remove('flex');
@@ -171,6 +228,10 @@ const inspectSql = async (filename) => {
     const data = new FormData();
     data.append('csrf_token', form.elements.csrf_token.value);
     data.append('filename', filename);
+    data.append('source_url', sourceUrl?.value.trim() || '');
+    let targetUrl = destinationUrl?.value.trim() || '';
+    if (forceHttps?.checked) targetUrl = targetUrl.replace(/^http:\/\//i, 'https://');
+    data.append('destination_url', targetUrl);
     try {
         const response = await fetch('?inspect_sql=1', { method: 'POST', body: data, credentials: 'same-origin' });
         const result = await response.json();
@@ -216,6 +277,17 @@ sqlSelect?.addEventListener('change', async () => {
         resetInspection();
     }
 });
+
+const refreshDomainInspection = async () => {
+    const filename = chunkedSqlFile?.value || sqlSelect?.value || '';
+    if (!filename || !sourceUrl?.value || !destinationUrl?.value) return;
+    if (!sourceUrl.checkValidity() || !destinationUrl.checkValidity()) return;
+    await inspectSql(filename);
+};
+
+sourceUrl?.addEventListener('change', refreshDomainInspection);
+destinationUrl?.addEventListener('change', refreshDomainInspection);
+forceHttps?.addEventListener('change', refreshDomainInspection);
 
 for (const eventName of ['dragenter', 'dragover']) {
     dropZone?.addEventListener(eventName, (event) => {

@@ -6,6 +6,8 @@ namespace Srdbm;
 
 use RuntimeException;
 
+require_once __DIR__ . '/DomainNormalizer.php';
+
 final class SqlDumpReplacer
 {
     /**
@@ -14,6 +16,8 @@ final class SqlDumpReplacer
      * @param array<string,string> $emailReplacements
      * @param array<string,string> $imagePathReplacements
      * @param array<string,string> $literalOverrides
+     * @param array{source?:string,target?:string} $domainNormalization
+     * @param list<string>|null $domainTables
      * @return array{changes:int, url_changes:int, prefix_changes:int, email_changes:int, image_changes:int, plugin_changes:int, bytes:int, elapsed:float}
      */
     public function process(
@@ -25,7 +29,9 @@ final class SqlDumpReplacer
         string $prefixReplace = '',
         array $emailReplacements = [],
         array $imagePathReplacements = [],
-        array $literalOverrides = []
+        array $literalOverrides = [],
+        array $domainNormalization = [],
+        ?array $domainTables = null
     ): array
     {
         if ($search === '') {
@@ -55,6 +61,12 @@ final class SqlDumpReplacer
         $pendingQuote = false;
         $literal = '';
         $outsideCarry = '';
+        $currentTable = null;
+        $sqlContext = '';
+        $domainNormalizer = isset($domainNormalization['source'], $domainNormalization['target'])
+            ? new DomainNormalizer((string) $domainNormalization['source'], (string) $domainNormalization['target'])
+            : null;
+        $domainTableSet = $domainTables === null ? null : array_fill_keys($domainTables, true);
 
         try {
             while (!feof($input)) {
@@ -78,7 +90,7 @@ final class SqlDumpReplacer
                         $literal .= "''";
                         $offset = 1;
                     } else {
-                        $this->writeLiteral($output, $literal, $search, $replace, $prefixSearch, $prefixReplace, $emailReplacements, $imagePathReplacements, $literalOverrides, $urlChanges, $prefixChanges, $emailChanges, $imageChanges, $pluginChanges);
+                        $this->writeLiteral($output, $literal, $search, $replace, $prefixSearch, $prefixReplace, $emailReplacements, $imagePathReplacements, $literalOverrides, $domainNormalizer, $domainTableSet, $currentTable, $urlChanges, $prefixChanges, $emailChanges, $imageChanges, $pluginChanges);
                         fwrite($output, "'");
                         $inLiteral = false;
                         $literal = '';
@@ -91,6 +103,7 @@ final class SqlDumpReplacer
                         $quote = strpos($chunk, "'", $offset);
                         if ($quote === false) {
                             $outside = substr($chunk, $offset);
+                            $this->updateTableContext($outside, $sqlContext, $currentTable);
                             if ($prefixSearch !== '') {
                                 $searchLength = strlen($prefixSearch);
                                 $carryLength = min(max($searchLength - 1, 0), strlen($outside));
@@ -109,7 +122,9 @@ final class SqlDumpReplacer
                             $this->writeOutside($output, $outside, $prefixSearch, $prefixReplace, $prefixChanges);
                             break;
                         }
-                        $this->writeOutside($output, substr($chunk, $offset, $quote - $offset), $prefixSearch, $prefixReplace, $prefixChanges);
+                        $outside = substr($chunk, $offset, $quote - $offset);
+                        $this->updateTableContext($outside, $sqlContext, $currentTable);
+                        $this->writeOutside($output, $outside, $prefixSearch, $prefixReplace, $prefixChanges);
                         fwrite($output, "'");
                         $inLiteral = true;
                         $literal = '';
@@ -157,7 +172,7 @@ final class SqlDumpReplacer
                         break;
                     }
 
-                    $this->writeLiteral($output, $literal, $search, $replace, $prefixSearch, $prefixReplace, $emailReplacements, $imagePathReplacements, $literalOverrides, $urlChanges, $prefixChanges, $emailChanges, $imageChanges, $pluginChanges);
+                    $this->writeLiteral($output, $literal, $search, $replace, $prefixSearch, $prefixReplace, $emailReplacements, $imagePathReplacements, $literalOverrides, $domainNormalizer, $domainTableSet, $currentTable, $urlChanges, $prefixChanges, $emailChanges, $imageChanges, $pluginChanges);
                     fwrite($output, "'");
                     $literal = '';
                     $inLiteral = false;
@@ -166,7 +181,7 @@ final class SqlDumpReplacer
             }
 
             if ($pendingQuote) {
-                $this->writeLiteral($output, $literal, $search, $replace, $prefixSearch, $prefixReplace, $emailReplacements, $imagePathReplacements, $literalOverrides, $urlChanges, $prefixChanges, $emailChanges, $imageChanges, $pluginChanges);
+                $this->writeLiteral($output, $literal, $search, $replace, $prefixSearch, $prefixReplace, $emailReplacements, $imagePathReplacements, $literalOverrides, $domainNormalizer, $domainTableSet, $currentTable, $urlChanges, $prefixChanges, $emailChanges, $imageChanges, $pluginChanges);
                 fwrite($output, "'");
                 $inLiteral = false;
             }
@@ -371,6 +386,9 @@ final class SqlDumpReplacer
         array $emailReplacements,
         array $imagePathReplacements,
         array $literalOverrides,
+        ?DomainNormalizer $domainNormalizer,
+        ?array $domainTableSet,
+        ?string $currentTable,
         int &$urlChanges,
         int &$prefixChanges,
         int &$emailChanges,
@@ -391,7 +409,15 @@ final class SqlDumpReplacer
         foreach ($imagePathReplacements as $pathSearch => $pathReplace) {
             $converted = $this->replaceValue($converted, $pathSearch, $pathReplace, $imageChanges);
         }
-        $converted = $this->replaceValue($converted, $search, $replace, $urlChanges);
+        if ($domainNormalizer !== null) {
+            if ($currentTable !== null && ($domainTableSet === null || isset($domainTableSet[$currentTable]))) {
+                $domainResult = $domainNormalizer->transform($converted);
+                $converted = $domainResult['value'];
+                $urlChanges += $domainResult['replacements'];
+            }
+        } else {
+            $converted = $this->replaceValue($converted, $search, $replace, $urlChanges);
+        }
         if ($prefixSearch !== '') {
             $converted = $this->replaceValue($converted, $prefixSearch, $prefixReplace, $prefixChanges);
         }
@@ -410,6 +436,28 @@ final class SqlDumpReplacer
         $converted = str_replace($prefixSearch, $prefixReplace, $value, $count);
         $prefixChanges += $count;
         fwrite($output, $converted);
+    }
+
+    private function updateTableContext(string $outside, string &$sqlContext, ?string &$currentTable): void
+    {
+        $parts = explode(';', $outside);
+        foreach ($parts as $index => $part) {
+            if ($index > 0) {
+                $sqlContext = '';
+                $currentTable = null;
+            }
+            $sqlContext .= $part;
+            if ($currentTable === null && preg_match(
+                '/\b(?:INSERT(?:\s+IGNORE)?\s+INTO|REPLACE\s+INTO|UPDATE|DELETE\s+FROM)\s+(?:(?:`[^`]+`|[A-Za-z0-9_$-]+)\s*\.\s*)?`?([A-Za-z0-9_$-]+)`?/i',
+                $sqlContext,
+                $match
+            ) === 1) {
+                $currentTable = $match[1];
+            }
+            if (strlen($sqlContext) > 4096) {
+                $sqlContext = substr($sqlContext, -4096);
+            }
+        }
     }
 
     private function replaceValue(string $value, string $search, string $replace, int &$changes): string
